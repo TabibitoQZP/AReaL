@@ -141,6 +141,32 @@ class TestStandaloneChat:
 
         assert isinstance(bridge.backend, VLLMBridgeBackend)
 
+    def test_config_passes_lora_to_bridge_and_client(self):
+        """Data proxy config wires LoRA settings into local generation clients."""
+        from areal.v2.inference_service.data_proxy.app import (
+            _create_areal_client,
+            _create_inf_bridge,
+        )
+        from areal.v2.inference_service.data_proxy.pause import PauseState
+
+        config = DataProxyConfig(
+            host="127.0.0.1",
+            port=18082,
+            backend_addr="http://mock-sglang:30000",
+            backend_type="sglang",
+            tokenizer_path="mock-tokenizer",
+            use_lora=True,
+            lora_name="my-adapter",
+        )
+        tok = MagicMock()
+        tok._tok = MagicMock()
+
+        bridge = _create_inf_bridge(config.backend_addr, PauseState(), config)
+        client = _create_areal_client(bridge, tok, config)
+
+        assert bridge.use_lora is True
+        assert client.lora_name == "my-adapter"
+
     @pytest.mark.asyncio
     async def test_no_auth_chat_completions_returns_valid_response(self, client):
         """No auth header → standalone mode, returns valid response."""

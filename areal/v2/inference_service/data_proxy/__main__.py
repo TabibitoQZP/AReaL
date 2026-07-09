@@ -75,6 +75,16 @@ def main():
         default="hf",
         choices=("hf", "concat"),
     )
+    parser.add_argument(
+        "--use-lora",
+        action="store_true",
+        help="Include versioned LoRA adapter names in generation requests.",
+    )
+    parser.add_argument(
+        "--lora-name",
+        default="",
+        help="Base LoRA adapter name used for versioned generation requests.",
+    )
     args, _ = parser.parse_known_args()
 
     validate_admin_api_key(args.host, args.admin_api_key)
@@ -102,6 +112,8 @@ def main():
         reasoning_parser=args.reasoning_parser,
         engine_max_tokens=args.engine_max_tokens,
         chat_template_type=args.chat_template_type,
+        use_lora=args.use_lora,
+        lora_name=args.lora_name,
     )
     suppress_http_loggers()
     app = create_app(config)

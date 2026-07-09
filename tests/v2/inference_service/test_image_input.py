@@ -18,11 +18,12 @@ import pytest_asyncio
 from PIL import Image
 
 from areal.api.cli_args import GenerationHyperparameters
-from areal.api.io_struct import ModelRequest
+from areal.api.io_struct import ModelRequest, ModelResponse
 from areal.experimental.openai.client import (
     _build_messages_list,
     _extract_images_from_messages,
 )
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.inf_bridge import InfBridge
 from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
@@ -45,6 +46,39 @@ def _make_data_uri(b64: str, mime: str = "image/png") -> str:
     return f"data:{mime};base64,{b64}"
 
 
+class _FakeVisionTokenizer:
+    eos_token_id = 2
+    pad_token_id = 0
+    unk_token_id = -1
+
+    def apply_chat_template(self, messages, tokenize=False, **kwargs):
+        assert tokenize is False
+        assert messages[0]["content"][1]["type"] == "image"
+        return "expanded prompt"
+
+    def convert_tokens_to_ids(self, token):
+        if token == "<|image_pad|>":
+            return 99
+        return self.unk_token_id
+
+
+class _FakeVisionProcessor:
+    tokenizer = _FakeVisionTokenizer()
+
+    def __call__(self, *, text, images, return_tensors):
+        assert text == ["expanded prompt"]
+        assert len(images) == 1
+        assert return_tensors == "pt"
+        import torch
+
+        return {
+            "input_ids": torch.tensor([[10, 99, 99, 20]], dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]], dtype=torch.long),
+            "pixel_values": torch.ones(2, 3, dtype=torch.float32),
+            "image_grid_thw": torch.tensor([[1, 2, 4]], dtype=torch.long),
+        }
+
+
 def _materialize(obj):
     """Recursively convert Pydantic ValidatorIterators (and other iterables) to plain lists/dicts."""
     if isinstance(obj, dict):
@@ -57,6 +91,43 @@ def _materialize(obj):
         return [_materialize(item) for item in obj]
     except TypeError:
         return obj
+
+
+def test_interaction_tensor_dict_rebuilds_multimodal_prompt(red_pixel_b64):
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _make_data_uri(red_pixel_b64)},
+                },
+            ],
+        }
+    ]
+    interaction = InteractionWithTokenLogpReward(
+        messages=messages,
+        model_response=ModelResponse(
+            input_tokens=[10, 99, 20],
+            output_tokens=[30, 31],
+            output_logprobs=[-0.3, -0.1],
+            output_versions=[4, 4],
+        ),
+        reward=1.0,
+    )
+
+    tensors = interaction.to_tensor_dict(processor=_FakeVisionProcessor())
+
+    assert tensors["input_ids"].tolist() == [[10, 99, 99, 20, 30, 31]]
+    assert tensors["loss_mask"].tolist() == [[0, 0, 0, 0, 1, 1]]
+    assert tensors["logprobs"].tolist()[0] == pytest.approx(
+        [0.0, 0.0, 0.0, 0.0, -0.3, -0.1]
+    )
+    assert tensors["versions"].tolist() == [[-1, -1, -1, -1, 4, 4]]
+    assert tensors["mm_token_type_ids"].tolist() == [[0, 1, 1, 0, 0, 0]]
+    assert tensors["attention_mask"].shape == tensors["input_ids"].shape
+    assert tensors["multi_modal_input"][0]["image_grid_thw"].tolist() == [[1, 2, 4]]
 
 
 @pytest.fixture

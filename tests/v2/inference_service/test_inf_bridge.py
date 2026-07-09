@@ -429,6 +429,65 @@ class TestInfBridge:
         assert resp.stop_reason == "length"
         bridge._send_request.assert_called_once()
 
+    # -- 15. LoRA adapter forwarded ---------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_lora_enabled_sends_sglang_lora_path(self):
+        """use_lora=True asks SGLang for the versioned LoRA adapter."""
+        captured_payloads: list[dict[str, Any]] = []
+
+        async def mock_send(http_req, **kwargs):
+            captured_payloads.append(dict(http_req.payload))
+            return _make_sglang_response([(-0.5, 100)], "stop")
+
+        bridge = _make_bridge(use_lora=True, version=3)
+        bridge._send_request = mock_send
+
+        req = _make_request(input_ids=[1, 2], lora_name="my_lora")
+        resp = await bridge.agenerate(req)
+
+        assert resp.stop_reason == "stop"
+        assert captured_payloads[0]["lora_path"] == get_versioned_lora_name(
+            "my_lora", 3
+        )
+
+    @pytest.mark.asyncio
+    async def test_lora_enabled_preserves_sglang_image_data(self):
+        """LoRA payload selection must not drop VLM image_data on resubmit."""
+        captured_payloads: list[dict[str, Any]] = []
+
+        async def mock_send(http_req, **kwargs):
+            captured_payloads.append(dict(http_req.payload))
+            if len(captured_payloads) == 1:
+                return _make_sglang_response([(-0.5, 100)], "abort")
+            return _make_sglang_response([(-0.3, 200)], "stop")
+
+        bridge = _make_bridge(use_lora=True, version=7)
+        bridge._send_request = mock_send
+
+        req = ModelRequest(
+            input_ids=[1, 2, 3],
+            gconfig=GenerationHyperparameters(
+                n_samples=1,
+                max_new_tokens=20,
+                max_tokens=32768,
+                lora_name="vlm_lora",
+            ),
+            metadata={},
+            image_data=["red_pixel"],
+        )
+        resp = await bridge.agenerate(req)
+
+        assert resp.output_tokens == [100, 200]
+        assert captured_payloads[0]["image_data"] == ["red_pixel"]
+        assert captured_payloads[1]["image_data"] == ["red_pixel"]
+        assert captured_payloads[0]["lora_path"] == get_versioned_lora_name(
+            "vlm_lora", 7
+        )
+        assert captured_payloads[1]["lora_path"] == get_versioned_lora_name(
+            "vlm_lora", 7
+        )
+
 
 class TestVLLMBridgeBackend:
     @pytest.mark.asyncio

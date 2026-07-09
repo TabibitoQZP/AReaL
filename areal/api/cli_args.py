@@ -1988,6 +1988,8 @@ class SGLangConfig:
     # lora
     enable_lora: bool | None = None
     max_lora_rank: int | None = None
+    lora_target_modules: list[str] | None = None
+    max_loras_per_batch: int = 8
     max_loaded_loras: int = 8  # override default
     lora_paths: list[str] | None = None  # lora_paths is automatically filled
     lora_backend: str = "triton"
@@ -2054,6 +2056,32 @@ class SGLangConfig:
     ):
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        lora_target_modules = args.get("lora_target_modules")
+        if isinstance(lora_target_modules, str):
+            lora_target_modules = [lora_target_modules]
+        if lora_target_modules:
+            if "all-linear" in lora_target_modules:
+                if len(lora_target_modules) != 1:
+                    raise ValueError(
+                        "If 'all-linear' is specified in "
+                        "sglang.lora_target_modules, it should be the only module."
+                    )
+                lora_target_modules = ["all"]
+            args["lora_target_modules"] = lora_target_modules
+
+        if args.get("enable_lora"):
+            if args["max_loaded_loras"] < args["max_loras_per_batch"]:
+                raise ValueError(
+                    "sglang.max_loaded_loras must be greater than or equal to "
+                    "sglang.max_loras_per_batch when LoRA is enabled "
+                    f"(got max_loaded_loras={args['max_loaded_loras']}, "
+                    f"max_loras_per_batch={args['max_loras_per_batch']})."
+                )
+            if not args.get("lora_paths") and not args.get("lora_target_modules"):
+                raise ValueError(
+                    "sglang.lora_target_modules is required when "
+                    "sglang.enable_lora=True and sglang.lora_paths is empty."
+                )
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
                 enable_multithread_load=sglang_config.enable_multithread_load,

@@ -180,6 +180,36 @@ class _PendingWeightUpdateBucket:
 _MULTIMODAL_FORWARD_KEYS = ("image_grid_thw", "pixel_values", "video_grid_thw")
 
 
+def _get_qwen_vl_position_model(model: nn.Module) -> nn.Module:
+    """Find the wrapped module that owns Qwen-VL mRoPE position helpers."""
+    candidates: list[nn.Module] = [model]
+    seen: set[int] = set()
+    visited_types: list[str] = []
+    wrapper_attrs = ("module", "model", "base_model")
+
+    while candidates:
+        candidate = candidates.pop(0)
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        visited_types.append(type(candidate).__name__)
+
+        if hasattr(candidate, "compute_3d_position_ids"):
+            return candidate
+
+        for attr in wrapper_attrs:
+            child = getattr(candidate, attr, None)
+            if isinstance(child, nn.Module) and id(child) not in seen:
+                candidates.append(child)
+
+    raise AttributeError(
+        "Could not find a Qwen-VL module exposing compute_3d_position_ids "
+        f"under wrapper {type(model).__name__}. "
+        f"Visited: {', '.join(visited_types) or 'none'}."
+    )
+
+
 def _is_multimodal_payload_key(key: str) -> bool:
     return is_multi_modal_key(key) or key in _MULTIMODAL_FORWARD_KEYS
 
@@ -1840,7 +1870,8 @@ class FSDPEngine(TrainEngine):
                 if video_grid_thw_list:
                     video_grid_thw = torch.cat(video_grid_thw_list)
 
-            position_ids = self.model.model.compute_3d_position_ids(
+            qwen_vl_position_model = _get_qwen_vl_position_model(self.model)
+            position_ids = qwen_vl_position_model.compute_3d_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,

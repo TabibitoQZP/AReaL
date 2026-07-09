@@ -4,6 +4,7 @@ from __future__ import annotations  # noqa
 
 import base64
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from io import BytesIO
@@ -16,6 +17,7 @@ from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
 from areal.utils import logging
+from areal.utils.hf_utils import apply_chat_template
 
 logger = logging.getLogger("TokenLogpReward")
 
@@ -64,6 +66,25 @@ def _image_pad_token_id(tokenizer) -> int | None:
     return None
 
 
+def _messages_for_processor_tokenizer(messages: list[dict]) -> list[dict]:
+    """Return OpenAI messages with image_url parts converted to HF image parts."""
+    messages_for_tokenizer: list[dict] = []
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            messages_for_tokenizer.append(deepcopy(msg))
+            continue
+
+        parts: list[Any] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                parts.append({"type": "image"})
+            else:
+                parts.append(deepcopy(part))
+        messages_for_tokenizer.append({**msg, "content": parts})
+    return messages_for_tokenizer
+
+
 def _attach_multi_modal_fields(
     result: dict[str, Any],
     messages: list[dict],
@@ -86,18 +107,47 @@ def _attach_multi_modal_fields(
     if not images:
         return
 
-    processed = processor.image_processor(images=images, return_tensors="pt")
+    messages_for_tokenizer = _messages_for_processor_tokenizer(messages)
+    prompt_text = apply_chat_template(
+        processor.tokenizer,
+        messages_for_tokenizer,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    processed = processor(text=[prompt_text], images=images, return_tensors="pt")
+
+    prompt_tokens = processed["input_ids"].squeeze(0).tolist()
+    seq = prompt_tokens + resp.output_tokens
+    prompt_len = len(prompt_tokens)
+    result["input_ids"] = torch.tensor(seq, dtype=torch.long).unsqueeze(0)
+    result["loss_mask"] = torch.tensor(
+        [0] * prompt_len + [1] * resp.output_len,
+        dtype=result["loss_mask"].dtype,
+    ).unsqueeze(0)
+    result["logprobs"] = torch.tensor(
+        [0.0] * prompt_len + resp.output_logprobs,
+        dtype=result["logprobs"].dtype,
+    ).unsqueeze(0)
+    result["versions"] = torch.tensor(
+        [-1] * prompt_len + resp.output_versions,
+        dtype=result["versions"].dtype,
+    ).unsqueeze(0)
+    result["attention_mask"] = torch.ones(len(seq), dtype=torch.bool).unsqueeze(0)
+
     mm_dict: dict[str, Any] = {"pixel_values": processed["pixel_values"]}
     if "image_grid_thw" in processed:
         mm_dict["image_grid_thw"] = processed["image_grid_thw"]
     result["multi_modal_input"] = [mm_dict]
 
-    image_pad_id = _image_pad_token_id(processor.tokenizer)
-    if image_pad_id is None:
-        return
-    mm_type = [1 if int(t) == image_pad_id else 0 for t in resp.input_tokens] + [
-        0
-    ] * resp.output_len
+    mm_token_type_ids = processed.get("mm_token_type_ids")
+    if mm_token_type_ids is not None:
+        mm_type = mm_token_type_ids.squeeze(0).tolist()
+    else:
+        image_pad_id = _image_pad_token_id(processor.tokenizer)
+        if image_pad_id is None:
+            return
+        mm_type = [1 if int(t) == image_pad_id else 0 for t in prompt_tokens]
+    mm_type = mm_type + [0] * resp.output_len
     result["mm_token_type_ids"] = torch.tensor(mm_type, dtype=torch.long).unsqueeze(0)
 
 
