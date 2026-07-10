@@ -18,6 +18,11 @@ from flask import Flask
 from pydantic import BaseModel
 
 from areal.experimental.openai.client import ArealOpenAI
+from areal.experimental.openai.trajectory import (
+    DEFAULT_TRAJECTORY_CONVERTER,
+    TrajectoryConverter,
+    build_trajectory_converter,
+)
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
@@ -313,7 +318,10 @@ async def _ready_trajectory_loop(app: FastAPI) -> None:
         await asyncio.sleep(0.1)
 
 
-def create_app(config: DataProxyConfig) -> FastAPI:
+def create_app(
+    config: DataProxyConfig,
+    trajectory_converter: TrajectoryConverter | None = None,
+) -> FastAPI:
     """Factory that creates the FastAPI app with lifespan-managed resources."""
 
     @asynccontextmanager
@@ -333,6 +341,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         app.state.session_store.set_admin_key(config.admin_api_key)
         app.state.version = 0
         app.state.http_client = create_httpx_client(timeout=config.request_timeout)
+        if trajectory_converter is None:
+            app.state.trajectory_converter = await asyncio.to_thread(
+                build_trajectory_converter,
+                config.tokenizer_path,
+            )
 
         if not config.backend_addr:
             app.state.tokenizer = None
@@ -361,6 +374,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         logger.info("Data proxy shutting down")
 
     app = FastAPI(title="AReaL Data Proxy", lifespan=lifespan)
+    app.state.trajectory_converter = (
+        trajectory_converter or DEFAULT_TRAJECTORY_CONVERTER
+    )
+    app.state.trajectory_converter_lock = asyncio.Lock()
     _registered_models: dict[str, dict[str, str | None]] = {}
 
     # =========================================================================
@@ -741,7 +758,21 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 continue
 
         if all(v.has_tensor_data for v in merged.values()):
-            traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
+            converter: TrajectoryConverter = app.state.trajectory_converter
+
+            def _convert_interactions() -> list[dict[str, Any]]:
+                return [
+                    (
+                        converter.convert(interaction)
+                        if interaction.model_response is not None
+                        else interaction.to_tensor_dict()
+                    )
+                    for interaction in merged.values()
+                ]
+
+            async with app.state.trajectory_converter_lock:
+                tensor_dicts = await asyncio.to_thread(_convert_interactions)
+            traj = concat_padded_tensors(tensor_dicts)
             traj = RTensor.remotize(traj, node_addr=config.serving_addr)
         else:
             traj = concat_string_interactions(merged)
