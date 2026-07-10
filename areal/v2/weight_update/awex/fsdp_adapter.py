@@ -67,6 +67,9 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         return getattr(self._engine.model_config, "tie_word_embeddings", False)
 
     def _to_transfer_dtype(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        # TODO(agent): This name-based exception mirrors Qwen3.5's checkpoint
+        # dtype and is only a temporary compatibility fix. Transfer dtypes should
+        # eventually come from a model-specific policy or inference metadata.
         if name.endswith(".A_log"):
             return tensor.to(torch.float32)
         return self._engine._cast_to_compute_dtype(tensor)
