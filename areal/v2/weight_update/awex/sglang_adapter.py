@@ -30,6 +30,7 @@ from awex.util.tensor_util import (
     reconstruct_tensors_from_groups,
 )
 
+from areal.engine.core.model import is_qwen3_5_model
 from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
@@ -66,6 +67,86 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
+
+    def _get_vision_intermediate_size(self) -> int:
+        vision_config = self._get_model().config.vision_config
+        return int(vision_config.intermediate_size)
+
+    @staticmethod
+    def _add_self_attn_prefix(name: str) -> str:
+        if not name.startswith("model.layers.") or ".self_attn." in name:
+            return name
+        for module_name in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"):
+            token = f".{module_name}."
+            if token in name:
+                return name.replace(token, f".self_attn.{module_name}.", 1)
+        return name
+
+    def _unfuse_qwen3_5_params(
+        self, name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]] | None:
+        config = self._get_model().config
+        if not is_qwen3_5_model(getattr(config, "model_type", "")):
+            return None
+
+        if "in_proj_qkvz" in name:
+            key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+            value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+            qkv_units = 2 * key_dim + value_dim
+            total_units = qkv_units + value_dim
+            qkv_size = tensor.shape[0] * qkv_units // total_units
+            z_size = tensor.shape[0] - qkv_size
+            return [
+                (
+                    name.replace("in_proj_qkvz", "in_proj_qkv"),
+                    tensor.narrow(0, 0, qkv_size),
+                ),
+                (
+                    name.replace("in_proj_qkvz", "in_proj_z"),
+                    tensor.narrow(0, qkv_size, z_size),
+                ),
+            ]
+
+        if "in_proj_ba" in name:
+            half = tensor.shape[0] // 2
+            return [
+                (
+                    name.replace("in_proj_ba", "in_proj_b"),
+                    tensor.narrow(0, 0, half),
+                ),
+                (
+                    name.replace("in_proj_ba", "in_proj_a"),
+                    tensor.narrow(0, half, half),
+                ),
+            ]
+
+        if "qkv_proj" in name:
+            q_heads = config.num_attention_heads * (
+                2 if getattr(config, "attn_output_gate", False) else 1
+            )
+            kv_heads = config.num_key_value_heads
+            total_head_units = q_heads + 2 * kv_heads
+            q_size = tensor.shape[0] * q_heads // total_head_units
+            kv_size = tensor.shape[0] * kv_heads // total_head_units
+            return [
+                (
+                    self._add_self_attn_prefix(name.replace("qkv_proj", "q_proj")),
+                    tensor.narrow(0, 0, q_size),
+                ),
+                (
+                    self._add_self_attn_prefix(name.replace("qkv_proj", "k_proj")),
+                    tensor.narrow(0, q_size, kv_size),
+                ),
+                (
+                    self._add_self_attn_prefix(name.replace("qkv_proj", "v_proj")),
+                    tensor.narrow(0, q_size + kv_size, kv_size),
+                ),
+            ]
+
+        canonical_name = self._add_self_attn_prefix(name)
+        if canonical_name != name:
+            return [(canonical_name, tensor)]
+        return None
 
     def _get_model_context(self) -> dict[str, Any]:
         server_args = self._scheduler.server_args
@@ -137,6 +218,30 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         into ``experts.w13_weight`` (gate+up) and ``experts.w2_weight`` (down).
         The training side keeps per-expert HF names, so we unfuse here to match.
         """
+        if name.startswith("visual.") and "qkv_proj" in name:
+            return [(name.replace("qkv_proj", "qkv"), tensor)]
+        if name.startswith("visual.") and "gate_up_proj" in name:
+            projection_size = tensor.shape[0] // 2
+            intermediate_size = self._get_vision_intermediate_size()
+            if intermediate_size > projection_size:
+                raise ValueError(
+                    "Vision intermediate size exceeds the SGLang projection size: "
+                    f"intermediate_size={intermediate_size}, "
+                    f"projection_size={projection_size}, name={name}"
+                )
+            return [
+                (
+                    name.replace("gate_up_proj", "gate_proj"),
+                    tensor.narrow(0, 0, intermediate_size),
+                ),
+                (
+                    name.replace("gate_up_proj", "up_proj"),
+                    tensor.narrow(0, projection_size, intermediate_size),
+                ),
+            ]
+        qwen3_5_params = self._unfuse_qwen3_5_params(name, tensor)
+        if qwen3_5_params is not None:
+            return qwen3_5_params
         if "qkv_proj" in name:
             cfg = self._get_model().config
             num_heads = cfg.num_attention_heads
@@ -162,6 +267,15 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 (name.replace("gate_up_proj", "gate_proj"), tensor.narrow(0, 0, half)),
                 (name.replace("gate_up_proj", "up_proj"), tensor.narrow(0, half, half)),
             ]
+        if name.startswith("visual.") and name.endswith("mlp.down_proj.weight"):
+            intermediate_size = self._get_vision_intermediate_size()
+            if intermediate_size > tensor.shape[1]:
+                raise ValueError(
+                    "Vision intermediate size exceeds the SGLang down projection "
+                    f"input size: intermediate_size={intermediate_size}, "
+                    f"input_size={tensor.shape[1]}, name={name}"
+                )
+            return [(name, tensor.narrow(1, 0, intermediate_size))]
         if "shared_experts" in name and "gate_up_weight" in name:
             half = tensor.shape[0] // 2
             return [
