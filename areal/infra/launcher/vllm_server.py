@@ -53,6 +53,7 @@ def launch_server_cmd(
     if custom_env is not None:
         _env.update(custom_env)
 
+    # XXX: 这个是直接CMD启动啊，那我怎么知道CMD对应的代码任务？
     return subprocess.Popen(
         command,
         env=_env,

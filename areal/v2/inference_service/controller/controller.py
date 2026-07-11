@@ -62,6 +62,7 @@ class _DummyDataLoader:
         yield [{} for _ in range(self.batch_size)]
 
 
+# XXX: 这个交叉对比areal/engine/vllm_remote.py, 如果是v1版本会选到前者, v2版本则是用这个
 class RolloutControllerV2:
     """Inference controller that routes everything through the gateway HTTP stack.
 
@@ -77,6 +78,7 @@ class RolloutControllerV2:
     (``"sglang"`` and ``"vllm"`` are supported).
     """
 
+    # XXX: RPC是啥？
     # Worker role suffix for RPCGuard workers
     _INF_SUFFIX = "-inf"
 
@@ -188,6 +190,7 @@ class RolloutControllerV2:
 
     # -- Initialize --------------------------------------------------------
 
+    # XXX: 介绍一下初始化过程
     def initialize(
         self,
         role: str,
@@ -241,6 +244,7 @@ class RolloutControllerV2:
     ) -> None:
         from areal.infra.utils.concurrent import run_async_task
 
+        # XXX: 这个是loop直到退出？
         run_async_task(
             self._async_initialize, server_args, server_infos, *args, **kwargs
         )

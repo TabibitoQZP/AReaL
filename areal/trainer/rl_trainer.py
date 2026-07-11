@@ -305,6 +305,7 @@ class PPOTrainer:
         initial_lora_path = self._save_initial_lora_weights()
 
         # Initialize inference with LoRA path
+        # XXX: 这个函数链路内会有v2的区别.
         self.rollout = self._init_rollout(
             config.rollout, is_eval=False, lora_path=initial_lora_path
         )

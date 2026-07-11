@@ -1010,7 +1010,9 @@ class WorkflowExecutor:
         except Exception as e:
             return False, f"dump failed: {e}"
 
+    # XXX: 这个的初始化也介绍一下。
     def initialize(self, logger=None, train_data_parallel_size: int | None = None):
+        # XXX: 最困惑的一个，这个意思是他们要自己设计生产者消费者来实现异步？vLLM之类的不是有异步引擎吗？
         """Initialize the workflow executor and start background threads.
 
         Creates and initializes BatchTaskDispatcher with StalenessManager.

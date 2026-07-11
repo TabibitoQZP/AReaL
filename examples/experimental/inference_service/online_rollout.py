@@ -42,6 +42,7 @@ def main(args: list[str]) -> None:
     from areal.infra.scheduler.local import LocalScheduler
     from areal.infra.scheduler.slurm import SlurmScheduler
 
+    # XXX: 这个是啥有啥用？
     sched_type = config.scheduler.type
     if sched_type == "local":
         scheduler = LocalScheduler(exp_config=config)
