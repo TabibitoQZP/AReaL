@@ -76,6 +76,7 @@ from areal.engine.core.model import (
     is_qwen3_vl_model,
     is_qwen_vl_model,
     is_valid_vision_model,
+    requires_padded_seq,
 )
 from areal.engine.fsdp_utils import (
     fsdp2_load_full_state_dict,
@@ -216,6 +217,64 @@ def _prepare_multimodal_forward_inputs(
     _drop_multimodal_payloads(mb)
 
 
+def _prepare_padded_seq_mb_list(mb_list: MicroBatchList) -> MicroBatchList:
+    """Keep model inputs in ``[B, S]`` while preserving packed loss inputs."""
+
+    packed_mbs: list[dict[str, Any]] = []
+    padded_mbs: list[dict[str, Any]] = []
+    padded_to_lengths: list[int] = []
+
+    for mb in mb_list.mbs:
+        attention_mask = mb.get("attention_mask")
+        if not torch.is_tensor(attention_mask) or attention_mask.ndim != 2:
+            raise ValueError(
+                "Padded-sequence models require a two-dimensional attention_mask."
+            )
+        batch_size, original_seqlen = attention_mask.shape
+        max_seqlen = int(attention_mask.sum(dim=1).max().item())
+
+        forward_mb: dict[str, Any] = {}
+        for key, value in mb.items():
+            if (
+                torch.is_tensor(value)
+                and value.ndim >= 2
+                and value.shape[0] == batch_size
+                and value.shape[1] == original_seqlen
+            ):
+                forward_mb[key] = value[:, :max_seqlen]
+            else:
+                forward_mb[key] = value
+
+        packed_mb = pack_tensor_dict(forward_mb)
+        forward_mb["cu_seqlens"] = packed_mb["cu_seqlens"]
+        forward_mb["max_seqlen"] = packed_mb["max_seqlen"]
+        packed_mbs.append(packed_mb)
+        padded_mbs.append(forward_mb)
+        padded_to_lengths.append(max_seqlen)
+
+    mb_list.mbs = packed_mbs
+    mb_list.padded_mbs = padded_mbs
+    mb_list.padding_lengths = [0] * len(packed_mbs)
+    mb_list.padded_to_lengths = padded_to_lengths
+    mb_list._max_seqlen = max(padded_to_lengths)
+    return mb_list
+
+
+def _flatten_padded_seq_values(
+    values: torch.Tensor, attention_mask: torch.Tensor
+) -> torch.Tensor:
+    """Flatten scalar per-token outputs in the same order as ``pack_tensor_dict``."""
+
+    valid = attention_mask.bool().reshape(-1)
+    flattened = values.reshape(-1)
+    if flattened.numel() != valid.numel():
+        raise ValueError(
+            "Padded model output does not match attention mask: "
+            f"values={values.shape}, attention_mask={attention_mask.shape}"
+        )
+    return flattened[valid]
+
+
 class FSDPEngine(TrainEngine):
     def __init__(self, config: TrainEngineConfig):
         self.config = config
@@ -242,6 +301,7 @@ class FSDPEngine(TrainEngine):
             trust_remote_code=True,
         )
         self.is_vision_model = is_valid_vision_model(self.model_config.model_type)
+        self.use_padded_seq = requires_padded_seq(self.model_config.model_type)
 
         # FSDP-specific initialization
         self.cpu_offload: CPUOffloadPolicy | None = None
@@ -1796,6 +1856,10 @@ class FSDPEngine(TrainEngine):
         input_ = input_.copy()
 
         # Tree training path
+        if self.use_padded_seq and self.enable_tree_training:
+            raise NotImplementedError(
+                "Padded-sequence models do not yet support FSDP tree training."
+            )
         if self.enable_tree_training:
             mb_list = build_packed_tree_batch(
                 input_,
@@ -1849,23 +1913,43 @@ class FSDPEngine(TrainEngine):
                 inputs_embeds=None,
                 past_key_values=None,
             )
+            if self.model_config.model_type == "qwen2_5_vl":
+                from areal.models.transformers.qwen2_vl import (
+                    correct_qwen2_5_vl_image_position_ids,
+                )
+
+                position_ids = correct_qwen2_5_vl_image_position_ids(
+                    position_ids,
+                    input_["mm_token_type_ids"],
+                    image_grid_thw,
+                    self.model_config.vision_config.spatial_merge_size,
+                )
             position_ids = torch.einsum("ijk->jki", position_ids)
             input_["position_ids"] = position_ids
         else:
             input_ = amend_position_ids(input_)
 
+        if self.use_padded_seq and self.parallel_helper.sp_size > 1:
+            raise NotImplementedError(
+                "Padded-sequence models do not yet support FSDP Ulysses sequence "
+                "parallelism. Use an FSDP backend with p1."
+            )
+
         mb_list = split_padded_tensor_dict_into_mb_list(input_, self.config.mb_spec)
-        mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
-        mb_list = pad_mb_list(
-            mb_list,
-            pad_value=0.0,
-            pad_to_maximum=self.config.pad_to_maximum,
-        )
+        if self.use_padded_seq:
+            mb_list = _prepare_padded_seq_mb_list(mb_list)
+        else:
+            mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
+            mb_list = pad_mb_list(
+                mb_list,
+                pad_value=0.0,
+                pad_to_maximum=self.config.pad_to_maximum,
+            )
+            mb_list = unsqueeze_mb_list(mb_list)
         self.logger.info(
             f"Microbatch #tokens (rank {dist.get_rank()}): {mb_list.group_lens}, "
             f"padded to: {mb_list.padded_to_lengths}, padding lengths: {mb_list.padding_lengths}"
         )
-        mb_list = unsqueeze_mb_list(mb_list)
         if is_qwen_vl_model(self.model_config.model_type):
             assert mb_list.padded_mbs is not None
             for mb in mb_list.padded_mbs:
@@ -1889,18 +1973,21 @@ class FSDPEngine(TrainEngine):
             ]
             mb["use_cache"] = False
             padded_mb["use_cache"] = False
-            if (
-                is_qwen3_moe_model(self.model_config.model_type)
-                or is_qwen3_vl_model(self.model_config.model_type)
-                or is_qwen3_5_model(self.model_config.model_type)
-            ):
-                mb["attention_mask"] = None
-                padded_mb["attention_mask"] = None
-            else:
-                mb["attention_mask"] = dict(full_attention=None, sliding_attention=None)
-                padded_mb["attention_mask"] = dict(
-                    full_attention=None, sliding_attention=None
-                )
+            if not self.use_padded_seq:
+                if (
+                    is_qwen3_moe_model(self.model_config.model_type)
+                    or is_qwen3_vl_model(self.model_config.model_type)
+                    or is_qwen3_5_model(self.model_config.model_type)
+                ):
+                    mb["attention_mask"] = None
+                    padded_mb["attention_mask"] = None
+                else:
+                    mb["attention_mask"] = dict(
+                        full_attention=None, sliding_attention=None
+                    )
+                    padded_mb["attention_mask"] = dict(
+                        full_attention=None, sliding_attention=None
+                    )
             _prepare_multimodal_forward_inputs(mb, padded_mb)
         _drop_multimodal_payloads(mb_list.data)
         return mb_list
@@ -2101,6 +2188,16 @@ class FSDPEngine(TrainEngine):
                 vocab_min_logits, vocab_max_logits = self._get_vocab_min_max_logits(
                     logits, ctx.ulysses_pad_size
                 )
+                if self.use_padded_seq:
+                    attention_mask = ctx.model_inputs["attention_mask"]
+                    logprobs = _flatten_padded_seq_values(logprobs, attention_mask)
+                    entropy = _flatten_padded_seq_values(entropy, attention_mask)
+                    vocab_min_logits = _flatten_padded_seq_values(
+                        vocab_min_logits, attention_mask
+                    )
+                    vocab_max_logits = _flatten_padded_seq_values(
+                        vocab_max_logits, attention_mask
+                    )
                 if ctx.pad_length > 0:
                     logprobs = logprobs[: -ctx.pad_length]
                     entropy = entropy[: -ctx.pad_length]
@@ -2115,6 +2212,10 @@ class FSDPEngine(TrainEngine):
             )
         else:
             values = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)
+            if self.use_padded_seq:
+                values = _flatten_padded_seq_values(
+                    values, ctx.model_inputs["attention_mask"]
+                )
             if ctx.pad_length > 0:
                 values = values[: -ctx.pad_length]
             loss = loss_fn(values, ctx.mb_input)
@@ -2149,6 +2250,10 @@ class FSDPEngine(TrainEngine):
             )
         else:
             result = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)
+        if self.use_padded_seq:
+            result = _flatten_padded_seq_values(
+                result, ctx.model_inputs["attention_mask"]
+            )
         if ctx.pad_length > 0:
             result = result[: -ctx.pad_length]
         return result

@@ -17,6 +17,76 @@ from areal.models.fsdp.ulysses import (
 )
 
 
+def correct_qwen2_5_vl_image_position_ids(
+    position_ids: torch.Tensor,
+    mm_token_type_ids: torch.Tensor,
+    image_grid_thw: torch.Tensor | None,
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    """Backport the fixed static-image mRoPE layout from Transformers 5.5.4.
+
+    Transformers 5.3.0 scales the temporal origin of still images by
+    ``tokens_per_second``. SGLang 0.5.10.post1 pins that affected release, while
+    its inference path and vLLM both use the corrected layout. This function is
+    behavior-based and becomes a no-op once the upstream fix is available.
+    """
+    if image_grid_thw is None or image_grid_thw.numel() == 0:
+        return position_ids
+    if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+        raise ValueError("Qwen2.5-VL position_ids must have shape [3, batch, sequence]")
+    if mm_token_type_ids.shape != position_ids.shape[1:]:
+        raise ValueError(
+            "mm_token_type_ids must match the batch and sequence dimensions "
+            "of position_ids"
+        )
+
+    corrected = position_ids
+    image_index = 0
+    for batch_index in range(mm_token_type_ids.shape[0]):
+        image_indices = torch.where(mm_token_type_ids[batch_index] == 1)[0]
+        if image_indices.numel() == 0:
+            continue
+
+        split_points = torch.where(image_indices[1:] != image_indices[:-1] + 1)[0]
+        starts = torch.cat([image_indices[:1], image_indices[split_points + 1]])
+        ends = torch.cat([image_indices[split_points] + 1, image_indices[-1:] + 1])
+
+        for start_tensor, end_tensor in zip(starts, ends, strict=True):
+            if image_index >= len(image_grid_thw):
+                raise ValueError("More image token groups than image_grid_thw entries")
+            start = int(start_tensor.item())
+            end = int(end_tensor.item())
+            grid_t, grid_h, grid_w = (
+                int(value.item()) for value in image_grid_thw[image_index]
+            )
+            grid_h //= spatial_merge_size
+            grid_w //= spatial_merge_size
+            expected_length = grid_t * grid_h * grid_w
+            if end - start != expected_length:
+                raise ValueError(
+                    "Image token group length does not match image_grid_thw: "
+                    f"{end - start} != {expected_length}"
+                )
+
+            start_position = position_ids[1, batch_index, start]
+            expected_temporal = torch.arange(
+                grid_t,
+                dtype=position_ids.dtype,
+                device=position_ids.device,
+            ).repeat_interleave(grid_h * grid_w)
+            expected_temporal = expected_temporal + start_position
+            current_temporal = position_ids[0, batch_index, start:end]
+            if not torch.equal(current_temporal, expected_temporal):
+                if corrected is position_ids:
+                    corrected = position_ids.clone()
+                corrected[0, batch_index, start:end] = expected_temporal
+            image_index += 1
+
+    if image_index != len(image_grid_thw):
+        raise ValueError("Fewer image token groups than image_grid_thw entries")
+    return corrected
+
+
 def ulysses_flash_attn_forward(
     self,
     hidden_states: torch.Tensor,
