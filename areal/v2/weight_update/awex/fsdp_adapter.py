@@ -18,7 +18,7 @@ from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
-from areal.engine.core.model import is_qwen_vl_model
+from areal.engine.core.model import is_qwen3_5_model, is_qwen_vl_model
 from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
@@ -66,6 +66,14 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
     def _tie_word_embeddings(self) -> bool:
         return getattr(self._engine.model_config, "tie_word_embeddings", False)
 
+    def _to_transfer_dtype(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        # TODO(agent): This name-based exception mirrors Qwen3.5's checkpoint
+        # dtype and is only a temporary compatibility fix. Transfer dtypes should
+        # eventually come from a model-specific policy or inference metadata.
+        if name.endswith(".A_log"):
+            return tensor.to(torch.float32)
+        return self._engine._cast_to_compute_dtype(tensor)
+
     def get_weight_metadata(self) -> list[ParameterMeta]:
         rank_info = self._build_rank_info()
         metadata: list[ParameterMeta] = []
@@ -74,7 +82,7 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             name = self._to_hf_name(raw_name)
             if self._tie_word_embeddings and name == "lm_head.weight":
                 continue
-            tensor = param.data
+            tensor = self._to_transfer_dtype(name, param.data)
             if isinstance(tensor, DTensor):
                 shard_meta = self._extract_dtensor_shard_meta(name, tensor, rank_info)
                 global_shape = tuple(tensor.shape)
@@ -113,7 +121,7 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             if required is not None and name not in required:
                 continue
 
-            tensor = param.data
+            tensor = self._to_transfer_dtype(name, param.data)
             if isinstance(tensor, DTensor):
                 local_params[name] = tensor._local_tensor
             else:
@@ -205,11 +213,15 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         self._transfer_rank = None
 
     def _to_hf_name(self, name: str) -> str:
-        if self._engine.is_vision_model and is_qwen_vl_model(
-            self._engine.model_config.model_type
-        ):
+        if self._engine.is_vision_model:
+            model_type = self._engine.model_config.model_type
+        else:
+            model_type = ""
+        if is_qwen_vl_model(model_type) or is_qwen3_5_model(model_type):
             new_name = name
-            if new_name.startswith("model.model."):
+            if new_name.startswith("model.language_model."):
+                new_name = new_name.replace("model.language_model.", "model.", 1)
+            elif new_name.startswith("model.model."):
                 new_name = new_name.replace("model.model.", "model.", 1)
             if new_name.startswith("model.visual."):
                 new_name = new_name.replace("model.", "", 1)
