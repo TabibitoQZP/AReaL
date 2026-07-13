@@ -1206,4 +1206,15 @@ class GatewayTrainController:
         if future is not None:
             future.cancel()
 
+        weight_update_ctrl = self._weight_update_ctrl
+        self._weight_update_ctrl = None
+        if weight_update_ctrl is not None:
+            try:
+                weight_update_ctrl.destroy()
+            except Exception:
+                logger.error(
+                    "Failed to destroy weight-update controller: %s",
+                    traceback.format_exc(),
+                )
+
         self._cleanup_runtime_state()

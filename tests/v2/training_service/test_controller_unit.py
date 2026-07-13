@@ -71,6 +71,24 @@ class _FakeAsyncClient:
         return next_item
 
 
+def test_destroy_closes_weight_update_controller_before_runtime_cleanup():
+    controller = _make_controller()
+    weight_update_ctrl = MagicMock()
+    controller._weight_update_ctrl = weight_update_ctrl
+    events = []
+    weight_update_ctrl.destroy.side_effect = lambda: events.append("weight-update")
+
+    with patch.object(
+        controller,
+        "_cleanup_runtime_state",
+        side_effect=lambda: events.append("runtime"),
+    ):
+        controller.destroy()
+
+    assert events == ["weight-update", "runtime"]
+    assert controller._weight_update_ctrl is None
+
+
 class TestGatewayTrainControllerInitialization:
     @pytest.mark.asyncio
     async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(self):
