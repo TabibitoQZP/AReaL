@@ -64,8 +64,8 @@ from areal.engine.core.model import (
     lang_config,
     requires_padded_seq,
 )
-from areal.engine.megatron_utils import (  # noqa: F401
-    megatron_bridge_patches,
+from areal.engine.megatron_utils import (
+    megatron_bridge_patches,  # noqa: F401
     megatron_core_patches,
 )
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
@@ -393,6 +393,9 @@ class MegatronEngine(TrainEngine):
                 bridge=self.bridge,
                 bridge_type=self.bridge_cls,
             )
+            megatron_core_patches.apply_qwen3_5_gdn_precision_patch(
+                self.hf_config.model_type
+            )
             self.tf_config = configure_pipeline_layer_splits(
                 self.parallel_strategy, self.hf_config, self.tf_config
             )
@@ -530,7 +533,9 @@ class MegatronEngine(TrainEngine):
                 model_config.param_sync_func = model_config.param_sync_func[0]
         model_config.finalize_model_grads_func = finalize_model_grads
         self._create_optimizer(ft_spec)
-        if self.optimizer is not None:
+        if self.optimizer is not None and getattr(
+            self.tf_config, "calculate_per_token_loss", False
+        ):
             model_config.grad_scale_func = self.optimizer.scale_loss
         self._initialized = True
 
@@ -1074,8 +1079,12 @@ class MegatronEngine(TrainEngine):
         else:
             # Compensate the legacy schedule's loss /= num_microbatches. The
             # per-microbatch loss is already globally normalized by W_total;
-            # optimizer loss scaling is handled by grad_scale_func.
-            loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
+            # legacy 2-tuple callback also applies optimizer loss scaling here.
+            loss_multiplier = (
+                mpu.get_data_parallel_world_size()
+                * self.optimizer.get_loss_scale().item()
+                * len(mb_list)
+            )
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]

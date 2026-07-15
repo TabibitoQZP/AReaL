@@ -2,9 +2,11 @@
 
 import torch
 
+from areal.engine.megatron_utils import megatron_core_patches
 from areal.engine.megatron_utils.megatron_core_patches import (
     _gdn_decay_and_beta,
     _uses_fp32_a_log_exp,
+    apply_qwen3_5_gdn_precision_patch,
 )
 
 
@@ -30,6 +32,21 @@ def test_gdn_decay_computes_a_log_exp_in_fp32():
 def test_gdn_precision_is_fixed_by_upstream_or_runtime_patch():
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 
+    apply_qwen3_5_gdn_precision_patch("qwen3_5_moe")
+
     assert getattr(GatedDeltaNet, "_areal_fp32_a_log_exp", False) or (
         _uses_fp32_a_log_exp(GatedDeltaNet._compute_g_and_beta)
     )
+
+
+def test_gdn_precision_patch_skips_unrelated_models(monkeypatch):
+    def fail_if_inspected(_):
+        raise AssertionError("unrelated models must not inspect GatedDeltaNet")
+
+    monkeypatch.setattr(
+        megatron_core_patches,
+        "_uses_fp32_a_log_exp",
+        fail_if_inspected,
+    )
+
+    apply_qwen3_5_gdn_precision_patch("qwen3")
