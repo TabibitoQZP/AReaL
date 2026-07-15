@@ -5,6 +5,7 @@ Distributed integration tests live in
 subprocesses and require GPUs.
 """
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -90,6 +91,95 @@ class TestUnwrapToGptModel:
 
         with pytest.raises(TypeError, match="could not be unwrapped"):
             unwrap_to_gpt_model(unsupported)
+
+
+class TestMegatronBridgePrecision:
+    @pytest.mark.parametrize(
+        ("dtype", "fp16", "bf16"),
+        [
+            (torch.float32, False, False),
+            (torch.float16, True, False),
+            (torch.bfloat16, False, True),
+        ],
+    )
+    def test_requested_dtype_overrides_bridge_config(self, dtype, fp16, bf16):
+        from areal.models.mcore.registry import make_hf_and_mcore_config
+
+        hf_config = SimpleNamespace(_name_or_path="old")
+        tf_config = SimpleNamespace(
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            fp16=False,
+            bf16=True,
+        )
+        bridge = SimpleNamespace(
+            hf_pretrained=SimpleNamespace(config=hf_config),
+            transformer_config=tf_config,
+        )
+
+        actual_hf_config, actual_tf_config = make_hf_and_mcore_config(
+            "/model", dtype, bridge=bridge, bridge_type="megatron-bridge"
+        )
+
+        assert actual_hf_config is hf_config
+        assert actual_hf_config._name_or_path == "/model"
+        assert actual_tf_config is tf_config
+        assert actual_tf_config.params_dtype == dtype
+        assert actual_tf_config.pipeline_dtype == dtype
+        assert actual_tf_config.fp16 is fp16
+        assert actual_tf_config.bf16 is bf16
+
+    def test_requested_dtype_overrides_model_provider(self, monkeypatch):
+        from areal.api.cli_args import MegatronEngineConfig
+        from areal.models.mcore import registry
+
+        monkeypatch.setattr(
+            registry.mpu, "get_tensor_model_parallel_world_size", lambda: 2
+        )
+        monkeypatch.setattr(
+            registry.mpu, "get_pipeline_model_parallel_world_size", lambda: 1
+        )
+        monkeypatch.setattr(registry.mpu, "get_context_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(
+            registry.mpu, "get_expert_model_parallel_world_size", lambda: 4
+        )
+        monkeypatch.setattr(
+            registry.mpu, "get_expert_tensor_parallel_world_size", lambda: 1
+        )
+
+        provider = SimpleNamespace(
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            fp16=False,
+            bf16=True,
+            calculate_per_token_loss=False,
+            mtp_num_layers=None,
+            finalize=MagicMock(),
+            provide_distributed_model=MagicMock(return_value=[]),
+        )
+        bridge = SimpleNamespace(to_megatron_provider=MagicMock(return_value=provider))
+        tf_config = SimpleNamespace(
+            params_dtype=torch.float32,
+            pipeline_dtype=torch.float32,
+            fp16=False,
+            bf16=False,
+        )
+
+        models = registry.make_mcore_model(
+            SimpleNamespace(model_type="qwen3_5_moe"),
+            tf_config,
+            mcore_config=MegatronEngineConfig(wrap_with_ddp=False),
+            bridge=bridge,
+            bridge_type="megatron-bridge",
+        )
+
+        assert models == []
+        assert provider.params_dtype == torch.float32
+        assert provider.pipeline_dtype == torch.float32
+        assert provider.fp16 is False
+        assert provider.bf16 is False
+        provider.finalize.assert_called_once_with()
+        provider.provide_distributed_model.assert_called_once()
 
 
 class TestExtractVisionFromMultiModal:
@@ -200,6 +290,422 @@ class TestExtractVisionFromMultiModal:
         assert "multi_modal_input" not in padded_mb
         assert "pixel_values" not in mb
         assert torch.equal(padded_mb["pixel_values"], torch.cat(pixel_values, dim=0))
+
+
+class TestContextParallelSupportValidation:
+    @staticmethod
+    def make_engine(
+        *,
+        model_type="qwen3_5_moe",
+        is_vision_model=True,
+        use_padded_seq=True,
+    ):
+        from areal.engine import megatron_engine
+
+        engine = object.__new__(megatron_engine.MegatronEngine)
+        engine.parallel_strategy = SimpleNamespace(
+            tensor_parallel_size=2,
+            context_parallel_size=2,
+            pipeline_parallel_size=1,
+        )
+        engine.hf_config = SimpleNamespace(
+            model_type=model_type,
+            text_config=SimpleNamespace(
+                linear_num_key_heads=16,
+                linear_num_value_heads=32,
+            ),
+        )
+        engine.is_vision_model = is_vision_model
+        engine.use_padded_seq = use_padded_seq
+        engine.bridge_cls = "megatron-bridge"
+        engine.config = SimpleNamespace(use_lora=False)
+        engine.enable_fp8 = False
+        engine.mcore_config = SimpleNamespace(enable_mtp=False)
+        return engine
+
+    def test_qwen35_vlm_cp_is_allowed(self):
+        engine = self.make_engine()
+
+        engine._validate_context_parallel_support()
+
+    def test_generic_llm_cp_keeps_existing_support(self):
+        engine = self.make_engine(
+            model_type="qwen3",
+            is_vision_model=False,
+            use_padded_seq=False,
+        )
+        engine.bridge_cls = "mbridge"
+
+        engine._validate_context_parallel_support()
+
+    def test_other_vlm_cp_is_rejected(self):
+        engine = self.make_engine(
+            model_type="qwen2_5_vl",
+            is_vision_model=True,
+            use_padded_seq=False,
+        )
+
+        with pytest.raises(NotImplementedError, match="requires the padded"):
+            engine._validate_context_parallel_support()
+
+    def test_qwen35_cp_requires_megatron_bridge(self):
+        engine = self.make_engine()
+        engine.bridge_cls = "mbridge"
+
+        with pytest.raises(NotImplementedError, match="megatron-bridge"):
+            engine._validate_context_parallel_support()
+
+    @pytest.mark.parametrize(
+        ("target", "message"),
+        [("lora", "LoRA"), ("fp8", "FP8"), ("mtp", "MTP")],
+    )
+    def test_unvalidated_training_modes_are_rejected(self, target, message):
+        engine = self.make_engine()
+        if target == "lora":
+            engine.config.use_lora = True
+        elif target == "fp8":
+            engine.enable_fp8 = True
+        else:
+            engine.mcore_config.enable_mtp = True
+
+        with pytest.raises(NotImplementedError, match=message):
+            engine._validate_context_parallel_support()
+
+    def test_linear_heads_must_be_divisible_by_tp_cp(self):
+        engine = self.make_engine()
+        engine.hf_config.text_config.linear_num_key_heads = 2
+
+        with pytest.raises(ValueError, match="linear_num_key_heads=2"):
+            engine._validate_context_parallel_support()
+
+
+class TestContextParallelVisionForward:
+    def test_text_only_vlm_batch_allows_cp(self, monkeypatch):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 2,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_: False,
+        )
+        model = MagicMock(return_value=torch.randn(4, 8))
+
+        packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.arange(4).reshape(1, 4),
+                "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+            },
+            is_vision_model=True,
+            use_padded_seq=True,
+        )
+
+        model.assert_called_once()
+
+    def test_vision_batch_forwards_payload_with_cp(self, monkeypatch):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 2,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_: False,
+        )
+        pixel_values = torch.randn(2, 4)
+        image_grid_thw = torch.tensor([[1, 1, 2]])
+        model = MagicMock(return_value=torch.randn(1, 4, 8))
+
+        packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.arange(4).reshape(1, 4),
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+            },
+            is_vision_model=True,
+            use_padded_seq=True,
+        )
+
+        kwargs = model.call_args.kwargs
+        torch.testing.assert_close(kwargs["pixel_values"], pixel_values)
+        torch.testing.assert_close(kwargs["image_grid_thw"], image_grid_thw)
+
+    @pytest.mark.parametrize(
+        "payload_key",
+        [
+            "video_grid_thw",
+            "pixel_values_videos",
+            "image_input_mask",
+            "video_input_mask",
+            "cp_img_num",
+            "images_padded",
+        ],
+    )
+    def test_non_image_payload_rejects_cp(self, monkeypatch, payload_key):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 2,
+        )
+
+        with pytest.raises(NotImplementedError, match="image inputs only"):
+            packed_context_parallel.packed_context_parallel_forward(
+                MagicMock(),
+                {
+                    "input_ids": torch.arange(4).reshape(1, 4),
+                    payload_key: torch.randn(2, 4),
+                },
+                is_vision_model=True,
+                use_padded_seq=True,
+            )
+
+
+class TestPerTokenLossNormalization:
+    def test_forward_backward_emits_mcore_three_tuple(self, monkeypatch):
+        from areal.engine import megatron_engine
+        from areal.utils.data import MicroBatchList
+
+        engine = object.__new__(megatron_engine.MegatronEngine)
+        engine._ensure_ready = MagicMock()
+        engine.enable_tree_training = False
+        engine.is_vision_model = False
+        engine.use_padded_seq = False
+        engine.model = [SimpleNamespace()]
+
+        original = {
+            "input_ids": torch.arange(4),
+            "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        }
+        padded = dict(original)
+        mb_list = MicroBatchList(
+            data=original,
+            mb_spec=MagicMock(),
+            mbs=[original],
+            group_lens=[4],
+            padded_mbs=[padded],
+            padding_lengths=[0],
+            padded_to_lengths=[4],
+        )
+
+        monkeypatch.setattr(
+            megatron_engine.mpu,
+            "get_context_parallel_world_size",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu,
+            "is_pipeline_last_stage",
+            lambda **kwargs: True,
+        )
+        monkeypatch.setattr(
+            megatron_engine,
+            "packed_context_parallel_forward",
+            lambda *args, **kwargs: torch.ones(4, 2),
+        )
+
+        captured = {}
+
+        def fake_schedule(**kwargs):
+            output, loss_func = kwargs["forward_step_func"](
+                kwargs["data_iterator"], kwargs["model"]
+            )
+            captured["mcore_loss_output"] = loss_func(output)
+
+        monkeypatch.setattr(
+            megatron_engine,
+            "get_forward_backward_func",
+            lambda: fake_schedule,
+        )
+
+        engine.forward_backward_batch(
+            mb_list,
+            process_output_fn=lambda output, inputs: (
+                output.sum(),
+                torch.tensor(inputs["input_ids"].numel(), dtype=torch.int32),
+            ),
+        )
+
+        loss, loss_weight, metrics = captured["mcore_loss_output"]
+        torch.testing.assert_close(loss, torch.tensor(8.0), rtol=0, atol=0)
+        torch.testing.assert_close(
+            loss_weight, torch.tensor(4, dtype=torch.int32), rtol=0, atol=0
+        )
+        assert metrics == {}
+
+    def test_zero_weight_returns_graph_connected_zero(self):
+        from areal.engine import megatron_engine
+
+        engine = object.__new__(megatron_engine.MegatronEngine)
+        output = torch.ones(4, 1, requires_grad=True)
+        inputs = {"loss_mask": torch.zeros(4, dtype=torch.bool)}
+
+        loss_sum, loss_weight = engine._compute_logprobs_and_loss(
+            output,
+            inputs,
+            loss_fn=MagicMock(),
+            loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+            total_loss_weight=None,
+            return_loss_sum_and_weight=True,
+        )
+
+        torch.testing.assert_close(loss_sum, torch.tensor(0.0), rtol=0, atol=0)
+        torch.testing.assert_close(
+            loss_weight, torch.tensor(0, dtype=torch.int32), rtol=0, atol=0
+        )
+        loss_sum.backward()
+        torch.testing.assert_close(
+            output.grad, torch.zeros_like(output), rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize(
+        ("cp_rank", "expected_loss", "expected_weight", "expected_grad"),
+        [(0, -4.0, 2, -1.0), (1, 0.0, 0, 0.0)],
+    )
+    def test_loss_sum_has_single_cp_owner(
+        self,
+        monkeypatch,
+        cp_rank,
+        expected_loss,
+        expected_weight,
+        expected_grad,
+    ):
+        from areal.engine import megatron_engine
+
+        engine = object.__new__(megatron_engine.MegatronEngine)
+        engine.config = SimpleNamespace(is_critic=False, temperature=1.0)
+        engine.enable_tree_training = False
+
+        monkeypatch.setattr(
+            megatron_engine.mpu,
+            "get_tensor_model_parallel_world_size",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            megatron_engine.mpu,
+            "get_context_parallel_rank",
+            lambda: cp_rank,
+        )
+
+        def fake_gather_logprobs_entropy(output, labels, **kwargs):
+            del labels, kwargs
+            logprobs = output.squeeze(-1)
+            return logprobs, torch.zeros_like(logprobs)
+
+        monkeypatch.setattr(
+            megatron_engine,
+            "gather_logprobs_entropy",
+            fake_gather_logprobs_entropy,
+        )
+
+        output = torch.tensor([[1.0], [2.0], [3.0], [4.0]], requires_grad=True)
+        inputs = {
+            "input_ids": torch.arange(4),
+            "loss_mask": torch.tensor([True, False, True, False]),
+        }
+
+        def loss_fn(logprobs, entropy, input_, **kwargs):
+            del entropy, kwargs
+            return -logprobs[input_["loss_mask"]].mean()
+
+        loss_sum, loss_weight = engine._compute_logprobs_and_loss(
+            output,
+            inputs,
+            loss_fn,
+            loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+            total_loss_weight=None,
+            return_loss_sum_and_weight=True,
+        )
+
+        torch.testing.assert_close(
+            loss_sum, torch.tensor(expected_loss), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            loss_weight,
+            torch.tensor(expected_weight, dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
+        assert loss_weight.ndim == 0
+        loss_sum.backward()
+        torch.testing.assert_close(
+            output.grad,
+            torch.tensor([[expected_grad], [0.0], [expected_grad], [0.0]]),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_train_batch_skips_legacy_global_normalization(self, monkeypatch):
+        from areal.engine import megatron_engine
+
+        class FakeMicroBatchList:
+            mbs = [{"loss_mask": torch.tensor([True, True])}]
+
+            def __len__(self):
+                return 4
+
+            def to(self, device):
+                del device
+                return self
+
+        engine = object.__new__(megatron_engine.MegatronEngine)
+        engine.device = torch.device("cpu")
+        engine.tf_config = SimpleNamespace(calculate_per_token_loss=True)
+        engine.optimizer = MagicMock()
+        engine.optimizer.get_loss_scale.return_value = torch.tensor(8.0)
+        engine.optimizer_zero_grad = MagicMock()
+        engine.optimizer_step = MagicMock(return_value={})
+        engine._ensure_ready = MagicMock()
+        engine._normalize_batch_input = MagicMock(
+            return_value=({"input_ids": torch.arange(2)}, None)
+        )
+        engine._prepare_mb_list = MagicMock(return_value=FakeMicroBatchList())
+        engine._compute_logprobs_and_loss = MagicMock(
+            return_value=(torch.tensor(16.0), torch.tensor(2))
+        )
+
+        def fail_legacy_normalization(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("legacy normalization must not run")
+
+        monkeypatch.setattr(
+            megatron_engine,
+            "compute_total_loss_weight",
+            fail_legacy_normalization,
+        )
+
+        captured = {}
+
+        def fake_forward_backward(mb_list, process_output, forward_only):
+            del mb_list, forward_only
+            captured["loss_output"] = process_output(
+                torch.ones(2, 1), {"loss_mask": torch.tensor([True, True])}
+            )
+
+        engine.forward_backward_batch = fake_forward_backward
+
+        engine.train_batch(
+            {"input_ids": torch.arange(2)},
+            loss_fn=MagicMock(),
+            loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+        )
+
+        assert captured["loss_output"] == (torch.tensor(16.0), torch.tensor(2))
+        call = engine._compute_logprobs_and_loss.call_args
+        assert call.args[4] is None
+        assert call.kwargs["loss_multiplier"] == 1.0
+        assert call.kwargs["return_loss_sum_and_weight"] is True
+        engine.optimizer.get_loss_scale.assert_not_called()
 
 
 class TestPrepareMbListRebindCallerSafety:

@@ -14,6 +14,7 @@ from megatron.core.transformer import TransformerConfig
 from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.cli_args import MegatronEngineConfig
+from areal.engine.core.model import is_qwen3_5_model
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -126,7 +127,12 @@ def make_hf_and_mcore_config(
         hf_config = getattr(bridge.hf_pretrained, "config", bridge.hf_pretrained)
         if hasattr(hf_config, "_name_or_path"):
             hf_config._name_or_path = hf_path
-        return hf_config, bridge.transformer_config
+        tf_config = bridge.transformer_config
+        tf_config.params_dtype = dtype
+        tf_config.pipeline_dtype = dtype
+        tf_config.fp16 = dtype == torch.float16
+        tf_config.bf16 = dtype == torch.bfloat16
+        return hf_config, tf_config
     else:
         hf_config: PretrainedConfig = AutoConfig.from_pretrained(
             pretrained_model_name_or_path=hf_path,
@@ -200,6 +206,9 @@ def make_mcore_model(
         provider = bridge.to_megatron_provider(load_weights=False)
         vpp_size = mcore_config.virtual_pipeline_parallel_size or 0
 
+        provider.params_dtype = tf_config.params_dtype
+        provider.fp16 = tf_config.fp16
+        provider.bf16 = tf_config.bf16
         provider.tensor_model_parallel_size = mpu.get_tensor_model_parallel_world_size()
         provider.pipeline_model_parallel_size = (
             mpu.get_pipeline_model_parallel_world_size()
@@ -213,7 +222,13 @@ def make_mcore_model(
             mpu.get_expert_tensor_parallel_world_size()
         )
         provider.sequence_parallel = mpu.get_tensor_model_parallel_world_size() > 1
-        provider.pipeline_dtype = tf_config.params_dtype
+        provider.pipeline_dtype = tf_config.pipeline_dtype
+        if provider.context_parallel_size > 1 and is_qwen3_5_model(
+            hf_config.model_type
+        ):
+            # Required by Megatron-Bridge for CP fine-tuning. AReaL normalizes
+            # its externally computed loss by the global token weight.
+            provider.calculate_per_token_loss = True
 
         provider.recompute_granularity = mcore_config.recompute_granularity
         provider.recompute_method = mcore_config.recompute_method
@@ -263,6 +278,7 @@ def make_mcore_model(
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
+        tf_config.calculate_per_token_loss = provider.calculate_per_token_loss
 
         provider.finalize()
 

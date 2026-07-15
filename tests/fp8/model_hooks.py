@@ -156,9 +156,7 @@ def collect_gradients_after_train_batch(
     )
 
     # Step 4: Forward-backward using Megatron's pipeline function
-    loss_multiplier = (
-        mpu.get_data_parallel_world_size() * engine.optimizer.get_loss_scale().item()
-    )
+    loss_multiplier = mpu.get_data_parallel_world_size()
 
     def process_output(output: torch.Tensor, inputs: dict[str, Any]) -> torch.Tensor:
         return engine._compute_logprobs_and_loss(

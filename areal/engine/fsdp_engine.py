@@ -180,6 +180,20 @@ class _PendingWeightUpdateBucket:
 _MULTIMODAL_FORWARD_KEYS = ("image_grid_thw", "pixel_values", "video_grid_thw")
 
 
+def _uses_qwen_multimodal_rope(model_type: str, is_vision_model: bool) -> bool:
+    return is_qwen_vl_model(model_type) or (
+        is_vision_model and is_qwen3_5_model(model_type)
+    )
+
+
+def _prepare_qwen_position_ids_for_packing(
+    position_ids: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if position_ids is None:
+        return None
+    return torch.einsum("ijk->jki", position_ids)
+
+
 def _is_multimodal_payload_key(key: str) -> bool:
     return is_multi_modal_key(key) or key in _MULTIMODAL_FORWARD_KEYS
 
@@ -1794,6 +1808,9 @@ class FSDPEngine(TrainEngine):
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
         input_ = input_.copy()
+        uses_qwen_multimodal_rope = _uses_qwen_multimodal_rope(
+            self.model_config.model_type, self.is_vision_model
+        )
 
         # Tree training path
         if self.enable_tree_training:
@@ -1811,7 +1828,7 @@ class FSDPEngine(TrainEngine):
             )
             return mb_list
 
-        if is_qwen_vl_model(self.model_config.model_type):
+        if uses_qwen_multimodal_rope:
             attn_mask = input_["attention_mask"]
             input_ids = input_["input_ids"]
             # NOTE: Qwen-VL get_rope_index performs indexed assignment where
@@ -1840,17 +1857,25 @@ class FSDPEngine(TrainEngine):
                 if video_grid_thw_list:
                     video_grid_thw = torch.cat(video_grid_thw_list)
 
+            mm_token_type_ids = input_.get("mm_token_type_ids")
+            if mm_token_type_ids is None:
+                raise ValueError(
+                    f"{self.model_config.model_type} image batches require "
+                    "mm_token_type_ids from the multimodal processor."
+                )
+
             position_ids = self.model.model.compute_3d_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
                 attention_mask=attn_mask,
-                mm_token_type_ids=input_["mm_token_type_ids"],
+                mm_token_type_ids=mm_token_type_ids,
                 inputs_embeds=None,
                 past_key_values=None,
             )
-            position_ids = torch.einsum("ijk->jki", position_ids)
-            input_["position_ids"] = position_ids
+            position_ids = _prepare_qwen_position_ids_for_packing(position_ids)
+            if position_ids is not None:
+                input_["position_ids"] = position_ids
         else:
             input_ = amend_position_ids(input_)
 
@@ -1866,10 +1891,11 @@ class FSDPEngine(TrainEngine):
             f"padded to: {mb_list.padded_to_lengths}, padding lengths: {mb_list.padding_lengths}"
         )
         mb_list = unsqueeze_mb_list(mb_list)
-        if is_qwen_vl_model(self.model_config.model_type):
+        if uses_qwen_multimodal_rope:
             assert mb_list.padded_mbs is not None
             for mb in mb_list.padded_mbs:
-                mb["position_ids"] = torch.einsum("ijk->kij", mb["position_ids"])
+                if "position_ids" in mb:
+                    mb["position_ids"] = torch.einsum("ijk->kij", mb["position_ids"])
 
         assert mb_list.padded_mbs is not None
         for i, mb in enumerate(mb_list.mbs):

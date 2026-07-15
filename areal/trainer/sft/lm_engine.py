@@ -105,7 +105,8 @@ def compute_packed_sft_loss(
     logprobs = torch.where(loss_mask, logprobs, 0)
 
     device = logprobs.device
-    loss = -logprobs.sum() / (1e-5 + loss_mask.count_nonzero())
+    num_valid_tokens = loss_mask.count_nonzero()
+    loss = -logprobs.sum() / num_valid_tokens.clamp_min(1)
     with torch.no_grad():
         batch_size = cu_seqlens.shape[0] - 1
         seqlogp = torch.zeros(batch_size, dtype=torch.float64, device=device)

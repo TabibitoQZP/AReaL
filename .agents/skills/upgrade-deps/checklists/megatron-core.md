@@ -43,17 +43,28 @@ upstream_paths:
 | `areal/models/mcore/lightning_attention.py`       | `parallel_state`, `apply_rotary_pos_emb`, `MegatronModule`, `ModuleSpec`, `build_module`                                                                                                               |
 | `areal/models/mcore/bailing_moe_bridge.py`        | `MLATransformerConfig`, `AttnBackend`                                                                                                                                                                  |
 | `areal/models/mcore/common.py`                    | `TransformerConfig`                                                                                                                                                                                    |
+| `areal/models/mcore/hf_load.py`                   | `parallel_state`, FP8 tensor detection                                                                                                                                                                 |
+| `areal/models/mcore/hf_save.py`                   | `parallel_state`, FP8 tensor detection                                                                                                                                                                 |
 | `areal/models/mcore/qwen3.py`                     | `gpt_layer_specs`, `TransformerConfig`                                                                                                                                                                 |
+| `areal/models/tree_attn/module_megatron.py`       | `PackedSeqParams`, `TransformerConfig`, attention and transformer layer APIs                                                                                                                           |
+| `areal/v2/weight_update/awex/megatron_adapter.py` | lazy `parallel_state` imports for rank and parallelism metadata                                                                                                                                        |
 
 ### Tertiary (tests, infra)
 
 | File                                                | Imports / Usage                                |
 | --------------------------------------------------- | ---------------------------------------------- |
 | `areal/infra/workflow_executor.py`                  | conditional `parallel_state` for DP world size |
+| `areal/tools/validate_docker_installation.py`       | Megatron import validation                     |
+| `areal/tools/validation_base.py`                    | package and submodule import validation        |
 | `tests/test_estimate_num_params.py`                 | `parallel_state`, `tensor_parallel`            |
 | `tests/fp8/engine_utils.py`                         | `parallel_state`                               |
 | `tests/fp8/model_hooks.py`                          | `parallel_state`                               |
 | `tests/fp8/test_fp8_rmsnorm.py`                     | `fp8_utils`, `get_model_config`                |
+| `tests/test_megatron_async_save.py`                 | mocked distributed checkpointing APIs          |
+| `tests/test_megatron_engine.py`                     | installed Megatron version diagnostics         |
+| `tests/test_megatron_engine_distributed.py`         | pipeline loss scaling regression coverage      |
+| `tests/test_megatron_engine_vlm.py`                 | `GPTModel` model-unwrapping tests              |
+| `tests/test_reassemble_cp_logprobs.py`              | optional Megatron import guard                 |
 | `tests/torchrun/run_megatron_engine_distributed.py` | `parallel_state`                               |
 
 ______________________________________________________________________

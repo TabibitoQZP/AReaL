@@ -2,7 +2,32 @@
 
 import torch
 
-from areal.engine.fsdp_engine import _prepare_multimodal_forward_inputs
+from areal.engine.fsdp_engine import (
+    _prepare_multimodal_forward_inputs,
+    _prepare_qwen_position_ids_for_packing,
+    _uses_qwen_multimodal_rope,
+)
+
+
+def test_qwen35_vision_model_uses_multimodal_rope():
+    assert _uses_qwen_multimodal_rope("qwen3_5_moe", is_vision_model=True)
+    assert not _uses_qwen_multimodal_rope("qwen3_5_moe_text", is_vision_model=False)
+    assert _uses_qwen_multimodal_rope("qwen3_vl_moe", is_vision_model=True)
+    assert not _uses_qwen_multimodal_rope("gemma3", is_vision_model=True)
+
+
+def test_qwen35_text_only_position_ids_are_left_for_model_inference():
+    assert _prepare_qwen_position_ids_for_packing(None) is None
+
+
+def test_qwen35_multimodal_position_ids_are_prepared_for_packing():
+    position_ids = torch.arange(3 * 2 * 5).reshape(3, 2, 5)
+
+    packed = _prepare_qwen_position_ids_for_packing(position_ids)
+
+    assert packed is not None
+    assert packed.shape == (2, 5, 3)
+    assert torch.equal(packed, position_ids.permute(1, 2, 0))
 
 
 def test_multimodal_forward_inputs_are_not_kept_in_loss_mb():

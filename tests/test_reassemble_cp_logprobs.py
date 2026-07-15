@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for reassemble_cp_packed_logprobs.
+"""Unit tests for packed and padded context-parallel reassembly.
 
 Validates that the reassembly operation is the correct inverse of
 split_packed_seqs_for_context_parallel, and that gradients flow correctly
@@ -419,6 +419,74 @@ class TestReassembleCpPackedLogprobs:
         # (since loss = sum(result) and each local position contributes once)
         expected_grad = torch.ones_like(local_tensor)
         torch.testing.assert_close(local_tensor.grad, expected_grad, rtol=0, atol=0)
+
+
+@requires_megatron
+class TestReassembleCpPaddedRows:
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    def test_split_reassemble_restores_valid_tokens(self, cp_size):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        seq_len = 8 * cp_size
+        full = torch.arange(3 * seq_len * 2, dtype=torch.float32).reshape(3, seq_len, 2)
+        seq_lens = torch.tensor([seq_len, seq_len - 3, seq_len // 2 + 1])
+        valid_mask = torch.arange(seq_len)[None, :] < seq_lens[:, None]
+
+        splits = []
+        for cp_rank in range(cp_size):
+            with patch.object(packed_context_parallel, "mpu") as mock_mpu:
+                mock_mpu.get_context_parallel_world_size.return_value = cp_size
+                mock_mpu.get_context_parallel_rank.return_value = cp_rank
+                splits.append(
+                    packed_context_parallel.split_padded_rows_for_context_parallel(full)
+                )
+
+        test_rank = 0
+        local_tensor = splits[test_rank].clone().requires_grad_(True)
+        with (
+            patch.object(packed_context_parallel, "mpu") as mock_mpu,
+            patch.object(packed_context_parallel, "dist_F") as mock_dist_f,
+        ):
+            mock_mpu.get_context_parallel_world_size.return_value = cp_size
+            mock_mpu.get_context_parallel_group.return_value = MagicMock()
+            mock_dist_f.all_gather.return_value = [
+                local_tensor if rank == test_rank else split.detach()
+                for rank, split in enumerate(splits)
+            ]
+
+            result = packed_context_parallel.reassemble_cp_padded_rows(
+                local_tensor, valid_mask
+            )
+
+        torch.testing.assert_close(result, full[valid_mask], rtol=0, atol=0)
+        result.sum().backward()
+        with patch.object(packed_context_parallel, "mpu") as mock_mpu:
+            mock_mpu.get_context_parallel_world_size.return_value = cp_size
+            mock_mpu.get_context_parallel_rank.return_value = test_rank
+            local_valid_mask = (
+                packed_context_parallel.split_padded_rows_for_context_parallel(
+                    valid_mask
+                )
+            )
+        torch.testing.assert_close(
+            local_tensor.grad,
+            local_valid_mask.unsqueeze(-1).expand_as(local_tensor).to(local_tensor),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_packed_to_padded_rows_preserves_trailing_dims(self):
+        from areal.engine.megatron_utils.packed_context_parallel import (
+            packed_to_padded_rows,
+        )
+
+        cu_seqlens = _make_cu_seqlens([3, 1, 4])
+        packed = torch.arange(16).reshape(8, 2)
+
+        padded, valid_mask = packed_to_padded_rows(packed, cu_seqlens)
+
+        assert padded.shape == (3, 4, 2)
+        torch.testing.assert_close(padded[valid_mask], packed, rtol=0, atol=0)
 
 
 @requires_megatron
