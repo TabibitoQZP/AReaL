@@ -3,7 +3,6 @@
 import datetime
 import json
 import os
-import re
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import deepcopy
@@ -54,6 +53,12 @@ from pydantic import BaseModel
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.message_utils import (
+    extract_images_from_messages as _extract_images_from_messages,
+)
+from areal.experimental.openai.message_utils import (
+    parse_tool_call_arguments as _parse_tool_call_arguments,
+)
 from areal.experimental.openai.tool_call_parser import process_tool_calls
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
@@ -144,99 +149,6 @@ def _find_kth(lst: list, target, k: int) -> int:
         return result
     except StopIteration:
         return -1
-
-
-# Regex for data URI: data:image/<subtype>;base64,<data>
-_DATA_URI_RE = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$", re.DOTALL)
-
-
-def _extract_images_from_messages(
-    messages: list[dict[str, Any]],
-) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Extract image data from OpenAI-format messages.
-
-    Scans message ``content`` lists for ``image_url`` content parts,
-    extracts base64 data (or raw URLs), and converts messages to a
-    HuggingFace-compatible format for ``apply_chat_template``.
-
-    Args:
-        messages: Normalized list of message dicts (OpenAI format).
-
-    Returns:
-        A 3-tuple of:
-
-        - **image_data** – list of base64 image strings (no data-URI prefix)
-          or raw URL strings for each image found.
-        - **messages_for_tokenizer** – deep copy of *messages* where every
-          ``{"type": "image_url", ...}`` part is replaced by
-          ``{"type": "image"}`` so that HuggingFace VLM tokenizers insert
-          the correct image-placeholder tokens.
-        - **vision_messages_for_vllm** – deep copy of *messages* where
-          ``image_url`` parts retain the ``image_url`` key but the ``url``
-          value is replaced with a placeholder (the actual base64 data URI
-          is injected later by the vLLM backend from *image_data*).
-    """
-    image_data: list[str] = []
-    messages_for_tokenizer: list[dict[str, Any]] = []
-    vision_messages_for_vllm: list[dict[str, Any]] = []
-
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            messages_for_tokenizer.append(deepcopy(msg))
-            vision_messages_for_vllm.append(deepcopy(msg))
-            continue
-
-        tok_parts: list[dict[str, Any]] = []
-        vllm_parts: list[dict[str, Any]] = []
-
-        for part in content:
-            if not isinstance(part, dict):
-                tok_parts.append(part)
-                vllm_parts.append(deepcopy(part))
-                continue
-
-            if part.get("type") == "image_url":
-                image_url_obj = part.get("image_url", {})
-                url = (
-                    image_url_obj.get("url", "")
-                    if isinstance(image_url_obj, dict)
-                    else ""
-                )
-
-                if not url:
-                    raise ValueError(
-                        "image_url content part has an empty or missing URL. "
-                        "Provide a valid data URI or HTTP(S) URL in "
-                        "image_url.url."
-                    )
-
-                # Extract base64 payload from data URIs; keep raw URLs as-is.
-                m = _DATA_URI_RE.match(url)
-                if m:
-                    image_data.append(m.group(1))
-                else:
-                    image_data.append(url)
-
-                tok_parts.append({"type": "image"})
-
-                # vLLM backend injects actual data URI from req.image_data.
-                vllm_parts.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": "placeholder"},
-                    }
-                )
-            else:
-                tok_parts.append(deepcopy(part))
-                vllm_parts.append(deepcopy(part))
-
-        tok_msg = {**msg, "content": tok_parts}
-        vllm_msg = {**msg, "content": vllm_parts}
-        messages_for_tokenizer.append(tok_msg)
-        vision_messages_for_vllm.append(vllm_msg)
-
-    return image_data, messages_for_tokenizer, vision_messages_for_vllm
 
 
 def _convert_tool_output_format(
@@ -355,43 +267,6 @@ def _resolve_max_total_tokens(
     # prompt + generation past the backend model's context window.
     cap = engine_max_tokens or _DEFAULT_MAX_TOTAL_TOKENS
     return min(prompt_len + max_new_tokens, cap)
-
-
-def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
-    """Return a new message list with tool_call arguments parsed from JSON strings
-    to dicts. Some chat templates (e.g. GLM-5.1) iterate over arguments with
-    .items(), which fails when arguments is a JSON string per OpenAI API convention.
-
-    Only creates new dicts where modifications are needed; unaffected messages
-    are shared with the input list to avoid expensive deep copies.
-    """
-    result = []
-    for msg in messages:
-        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
-        if not tool_calls:
-            result.append(msg)
-            continue
-        new_tool_calls = []
-        modified = False
-        for tc in tool_calls:
-            fn = tc.get("function") if isinstance(tc, dict) else None
-            if fn is None:
-                new_tool_calls.append(tc)
-                continue
-            args = fn.get("arguments")
-            if isinstance(args, str):
-                try:
-                    parsed = json.loads(args)
-                    tc = {**tc, "function": {**fn, "arguments": parsed}}
-                    modified = True
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            new_tool_calls.append(tc)
-        if modified:
-            result.append({**msg, "tool_calls": new_tool_calls})
-        else:
-            result.append(msg)
-    return result
 
 
 def concat_prompt_token_ids_with_parent(
@@ -655,6 +530,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             if not isinstance(tools, Iterable):
                 raise TypeError("tools must be an iterable of ChatCompletionToolParam")
             tools_list = list(tools)
+        if interaction is not None:
+            interaction.tools = deepcopy(tools_list)
+            interaction.chat_template_kwargs = deepcopy(
+                extra_body.get("chat_template_kwargs", {})
+            )
 
         image_data, messages_for_tokenizer, vision_messages_for_vllm = (
             _extract_images_from_messages(messages_list)
@@ -1101,6 +981,10 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             if not isinstance(tools, Iterable):
                 raise TypeError("tools must be an iterable of ChatCompletionToolParam")
             tools_list = list(tools)
+        interaction.tools = deepcopy(tools_list)
+        interaction.chat_template_kwargs = deepcopy(
+            extra_body.get("chat_template_kwargs", {})
+        )
 
         image_data, messages_for_tokenizer, vision_messages_for_vllm = (
             _extract_images_from_messages(messages_list)
