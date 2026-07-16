@@ -56,6 +56,8 @@ class InfBridge:
         Sleep duration (seconds) between pause-state polls.
     version:
         Initial weight version.
+    use_lora:
+        Whether generation requests should select a versioned LoRA adapter.
     """
 
     def __init__(
@@ -67,6 +69,7 @@ class InfBridge:
         max_resubmit_retries: int = 20,
         resubmit_wait: float = 0.5,
         version: int = 0,
+        use_lora: bool = False,
     ) -> None:
         self.backend = backend
         self.backend_addr = backend_addr.rstrip("/")
@@ -75,6 +78,7 @@ class InfBridge:
         self.max_resubmit_retries = max_resubmit_retries
         self.resubmit_wait = resubmit_wait
         self._version = version
+        self.use_lora = use_lora
         self._client = httpx.AsyncClient(timeout=request_timeout)
 
     async def aclose(self) -> None:
@@ -175,7 +179,7 @@ class InfBridge:
         # Build the initial HTTP request via the backend
         http_req = self.backend.build_generation_request(
             req,
-            with_lora=False,
+            with_lora=self.use_lora,
             version=self._version,
         )
 

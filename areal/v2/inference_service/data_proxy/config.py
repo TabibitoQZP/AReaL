@@ -26,3 +26,9 @@ class DataProxyConfig:
     reasoning_parser: str = "qwen3"
     engine_max_tokens: int | None = None
     chat_template_type: str = "hf"
+    use_lora: bool = False
+    lora_name: str = ""
+
+    def __post_init__(self) -> None:
+        if self.use_lora and not self.lora_name:
+            raise ValueError("lora_name is required when use_lora=True")

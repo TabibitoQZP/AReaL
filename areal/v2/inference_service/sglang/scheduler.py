@@ -186,11 +186,15 @@ def areal_run_scheduler_process(
     )
     from sglang.utils import get_exception_traceback
 
+    from areal.v2.inference_service.sglang.compat import (
+        patch_sglang_lora_config_compat,
+    )
     from areal.v2.inference_service.sglang.pp_bridge import (
         PPSchedulerBridge,
     )
 
     logger = logging.getLogger(__name__)
+    patch_sglang_lora_config_compat()
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )

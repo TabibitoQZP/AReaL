@@ -406,6 +406,62 @@ class TestLocalLaunchPPSizeThreading:
         joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
         assert ("pp-size" in joined) or ("pp_size" in joined)
 
+    def test_build_args_propagates_lora_target_modules_and_capacity(self):
+        from areal.api.cli_args import SGLangConfig
+
+        cfg = SGLangConfig(
+            model_path="/tmp/ignored",
+            enable_lora=True,
+            max_lora_rank=8,
+            lora_target_modules=["q_proj", "v_proj"],
+            max_loras_per_batch=4,
+            max_loaded_loras=4,
+        )
+        args = SGLangConfig.build_args(
+            sglang_config=cfg,
+            tp_size=1,
+            base_gpu_id=0,
+        )
+
+        assert args["lora_target_modules"] == ["q_proj", "v_proj"]
+        assert args["max_loras_per_batch"] == 4
+        assert args["max_loaded_loras"] == 4
+
+    def test_build_args_maps_all_linear_lora_target_modules(self):
+        from areal.api.cli_args import SGLangConfig
+
+        cfg = SGLangConfig(
+            model_path="/tmp/ignored",
+            enable_lora=True,
+            max_lora_rank=8,
+            lora_target_modules=["all-linear"],
+        )
+        args = SGLangConfig.build_args(
+            sglang_config=cfg,
+            tp_size=1,
+            base_gpu_id=0,
+        )
+
+        assert args["lora_target_modules"] == ["all"]
+
+    def test_build_args_rejects_invalid_lora_capacity(self):
+        from areal.api.cli_args import SGLangConfig
+
+        cfg = SGLangConfig(
+            model_path="/tmp/ignored",
+            enable_lora=True,
+            max_lora_rank=8,
+            lora_target_modules=["q_proj"],
+            max_loras_per_batch=8,
+            max_loaded_loras=4,
+        )
+        with pytest.raises(ValueError, match="max_loaded_loras"):
+            SGLangConfig.build_args(
+                sglang_config=cfg,
+                tp_size=1,
+                base_gpu_id=0,
+            )
+
     def test_rl_trainer_sglang_branch_passes_pp_size(self):
         """Source-level regression: the SGLang branch in rl_trainer.py must
         pass ``pp_size=...parallel.pp_size`` into ``SGLangConfig.build_args``.

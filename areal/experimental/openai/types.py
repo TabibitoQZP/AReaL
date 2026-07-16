@@ -2,8 +2,13 @@
 
 from __future__ import annotations  # noqa
 
+import base64
+import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from io import BytesIO
+from typing import Any
 
 import torch
 from openai.types.chat import ChatCompletion
@@ -12,8 +17,138 @@ from openai.types.responses.response_input_param import ResponseInputParam
 
 from areal.api import ModelResponse
 from areal.utils import logging
+from areal.utils.hf_utils import apply_chat_template
 
 logger = logging.getLogger("TokenLogpReward")
+
+_DATA_URL_RE = re.compile(r"^data:image/[^;]+;base64,")
+
+
+def _decode_data_url_image(url: str) -> Any:
+    from PIL import Image
+
+    m = _DATA_URL_RE.match(url)
+    if not m:
+        return None
+    try:
+        raw = base64.b64decode(url[m.end() :])
+        return Image.open(BytesIO(raw)).convert("RGB")
+    except Exception:
+        logger.warning("Failed to decode data-URL image", exc_info=True)
+        return None
+
+
+def _extract_images_from_messages(messages: list[dict] | None) -> list:
+    """Walk OpenAI-format messages and return PIL images from image_url parts."""
+    images: list = []
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            url = (part.get("image_url") or {}).get("url", "")
+            if not isinstance(url, str) or not url:
+                continue
+            img = _decode_data_url_image(url)
+            if img is not None:
+                images.append(img)
+    return images
+
+
+def _image_pad_token_id(tokenizer) -> int | None:
+    """Return the image-placeholder token id for Qwen-VL / gemma-style tokenizers."""
+    for tok in ("<|image_pad|>", "<image>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if tid is not None and tid != tokenizer.unk_token_id:
+            return int(tid)
+    return None
+
+
+def _messages_for_processor_tokenizer(messages: list[dict]) -> list[dict]:
+    """Return OpenAI messages with image_url parts converted to HF image parts."""
+    messages_for_tokenizer: list[dict] = []
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            messages_for_tokenizer.append(deepcopy(msg))
+            continue
+
+        parts: list[Any] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                parts.append({"type": "image"})
+            else:
+                parts.append(deepcopy(part))
+        messages_for_tokenizer.append({**msg, "content": parts})
+    return messages_for_tokenizer
+
+
+def _attach_multi_modal_fields(
+    result: dict[str, Any],
+    messages: list[dict],
+    resp: ModelResponse,
+    processor: Any,
+) -> None:
+    """Populate ``multi_modal_input`` and ``mm_token_type_ids`` in-place.
+
+    Extracts PIL images from OpenAI-format ``messages``, feeds them through the
+    processor's image branch to get ``pixel_values`` (+ ``image_grid_thw`` when
+    the model reports patch grids), and derives ``mm_token_type_ids`` from
+    ``resp.input_tokens`` by flagging image-placeholder positions. No-op when
+    the interaction carries no images.
+
+    Called from :meth:`InteractionWithTokenLogpReward.to_tensor_dict` so the
+    training-side batch has the multi-modal payload the VLM forward path
+    (``extract_vision_from_multi_modal``, ``get_rope_index``) requires.
+    """
+    images = _extract_images_from_messages(messages)
+    if not images:
+        return
+
+    messages_for_tokenizer = _messages_for_processor_tokenizer(messages)
+    prompt_text = apply_chat_template(
+        processor.tokenizer,
+        messages_for_tokenizer,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    processed = processor(text=[prompt_text], images=images, return_tensors="pt")
+
+    prompt_tokens = processed["input_ids"].squeeze(0).tolist()
+    seq = prompt_tokens + resp.output_tokens
+    prompt_len = len(prompt_tokens)
+    result["input_ids"] = torch.tensor(seq, dtype=torch.long).unsqueeze(0)
+    result["loss_mask"] = torch.tensor(
+        [0] * prompt_len + [1] * resp.output_len,
+        dtype=result["loss_mask"].dtype,
+    ).unsqueeze(0)
+    result["logprobs"] = torch.tensor(
+        [0.0] * prompt_len + resp.output_logprobs,
+        dtype=result["logprobs"].dtype,
+    ).unsqueeze(0)
+    result["versions"] = torch.tensor(
+        [-1] * prompt_len + resp.output_versions,
+        dtype=result["versions"].dtype,
+    ).unsqueeze(0)
+    result["attention_mask"] = torch.ones(len(seq), dtype=torch.bool).unsqueeze(0)
+
+    mm_dict: dict[str, Any] = {"pixel_values": processed["pixel_values"]}
+    if "image_grid_thw" in processed:
+        mm_dict["image_grid_thw"] = processed["image_grid_thw"]
+    result["multi_modal_input"] = [mm_dict]
+
+    mm_token_type_ids = processed.get("mm_token_type_ids")
+    if mm_token_type_ids is not None:
+        mm_type = mm_token_type_ids.squeeze(0).tolist()
+    else:
+        image_pad_id = _image_pad_token_id(processor.tokenizer)
+        if image_pad_id is None:
+            return
+        mm_type = [1 if int(t) == image_pad_id else 0 for t in prompt_tokens]
+    mm_type = mm_type + [0] * resp.output_len
+    result["mm_token_type_ids"] = torch.tensor(mm_type, dtype=torch.long).unsqueeze(0)
 
 
 class ApiType(str, Enum):
@@ -140,14 +275,14 @@ class InteractionWithTokenLogpReward:
         parent_len = len(self.parent.messages + self.parent.output_message_list)
         return self.messages[parent_len:]
 
-    def to_tensor_dict(self) -> dict[str, torch.Tensor]:
+    def to_tensor_dict(self, processor: Any = None) -> dict[str, torch.Tensor]:
         if self._cache is not None:
             return self._cache
         resp = self.model_response
         assert resp is not None, "Model response is not set."
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
         if self.chat_template_type == "concat" and self.parent is not None:
-            parent_res = self.parent.to_tensor_dict()
+            parent_res = self.parent.to_tensor_dict(processor=processor)
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
             parent_loss_mask = parent_res["loss_mask"].squeeze(0).tolist()
             parent_versions = parent_res["versions"].squeeze(0).tolist()
@@ -202,6 +337,8 @@ class InteractionWithTokenLogpReward:
             # reward
             rewards=torch.tensor([float(reward)]),
         )
+        if processor is not None:
+            _attach_multi_modal_fields(result, self.messages, resp, processor)
         self._cache = result
         return result
 

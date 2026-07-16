@@ -471,6 +471,12 @@ class RolloutControllerV2:
             "--chat-template-type",
             agent_cfg.chat_template_type,
         ]
+        if cfg.use_lora:
+            data_proxy_base_cmd += [
+                "--use-lora",
+                "--lora-name",
+                cfg.lora_name,
+            ]
         if agent_cfg.engine_max_tokens is not None:
             data_proxy_base_cmd += [
                 "--engine-max-tokens",
