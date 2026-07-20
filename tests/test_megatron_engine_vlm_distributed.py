@@ -239,6 +239,28 @@ def test_qwen3_5_vl_context_parallel_train(tmp_path_factory):
     )
 
 
+@pytest.mark.gpu
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+def test_qwen3_5_vl_context_parallel_train_with_mtp(tmp_path_factory):
+    """Qwen3.5-VL MTP training must consume CP-local token IDs.
+
+    The bridge already CP-splits fused vision/text embeddings, while MTP
+    separately embeds ``input_ids``. This covers the required alignment for
+    a CP-local decoder and MTP's boundary-token exchange.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("context parallel requires at least 2 GPUs")
+    output = str(tmp_path_factory.mktemp("vlm_test") / "qwen3_5_cp_mtp_train.out")
+    _run_vlm_test(
+        "train_mtp",
+        output,
+        backend="megatron:d1p1t1c2",
+        env_overrides=_QWEN3_5_VLM_ENV,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Qwen3-VL-MoE: 30B-A3B-Instruct under hybrid (attn|ffn) allocation.
 # CP > 1 is rejected at init for non-Qwen3.5 VLMs (no CP wiring in their

@@ -93,6 +93,7 @@ def make_vlm_engine(
     backend: str,
     init_optimizer: bool = False,
     wrap_with_ddp: bool = True,
+    enable_mtp: bool = False,
 ) -> MegatronEngine:
     """Build a MegatronEngine for VLM tests.
 
@@ -112,7 +113,9 @@ def make_vlm_engine(
         mb_spec=MicroBatchSpec(max_tokens_per_mb=4096),
         optimizer=OptimizerConfig() if init_optimizer else None,
         megatron=MegatronEngineConfig(
-            bridge_type=bridge_type, wrap_with_ddp=wrap_with_ddp
+            bridge_type=bridge_type,
+            wrap_with_ddp=wrap_with_ddp,
+            enable_mtp=enable_mtp,
         ),
         gradient_checkpointing=True,
     )
@@ -269,12 +272,20 @@ def test_vlm_dcp_save_load(backend: str, output: str | None = None):
     print(f"rank {rank}: test_vlm_dcp_save_load({backend}) Done.")
 
 
-def test_vlm_train(backend: str, output: str | None = None):
+def test_vlm_train(
+    backend: str,
+    output: str | None = None,
+    enable_mtp: bool = False,
+):
     """Test VLM training step."""
     rank = int(os.environ["RANK"])
 
     try:
-        engine = make_vlm_engine(backend, init_optimizer=True)
+        engine = make_vlm_engine(
+            backend,
+            init_optimizer=True,
+            enable_mtp=enable_mtp,
+        )
         bcasted_input = _make_input(engine)
 
         engine.train()
@@ -312,7 +323,7 @@ def main():
     parser.add_argument(
         "--test_type",
         type=str,
-        choices=["init", "forward", "save_load", "dcp_save_load", "train"],
+        choices=["init", "forward", "save_load", "dcp_save_load", "train", "train_mtp"],
         default="train",
     )
     args = parser.parse_args()
@@ -328,6 +339,8 @@ def main():
         test_vlm_dcp_save_load(args.backend, output=args.output)
     elif args.test_type == "train":
         test_vlm_train(args.backend, output=args.output)
+    elif args.test_type == "train_mtp":
+        test_vlm_train(args.backend, output=args.output, enable_mtp=True)
     else:
         raise NotImplementedError(f"Unknown test type: {args.test_type}")
 
