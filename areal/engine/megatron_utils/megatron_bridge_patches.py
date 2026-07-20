@@ -123,6 +123,61 @@ def _patch_qwen3vl_pr3143_word_embeddings() -> None:
     )
 
 
+def _patch_qwen3vl_mtp_cp_input_ids() -> None:
+    """Align Qwen3-VL MTP token IDs with the bridge's CP-local decoder input.
+
+    megatron-bridge 0.5.0 splits fused text/vision embeddings with its zigzag
+    CP layout before the decoder, but passes the original full ``input_ids``
+    into ``Qwen3VLGPTModel._postprocess``.  MTP derives its next-token
+    embeddings from those IDs, so its full-length embedding cannot concatenate
+    with CP-local decoder hidden states.  mcore's MTP implementation already
+    handles CP boundary exchange once it receives the local zigzag layout.
+    """
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import (
+            Qwen3VLGPTModel,
+        )
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
+            split_data_cp_rank,
+        )
+    except ImportError:
+        return
+
+    if getattr(Qwen3VLGPTModel, "_areal_mtp_cp_input_ids_applied", False):
+        return
+
+    original_forward = Qwen3VLGPTModel.forward
+
+    def _patched_forward(
+        self, input_ids, position_ids, attention_mask, *args, **kwargs
+    ):
+        decoder_input = kwargs.get("decoder_input")
+        if decoder_input is None and args:
+            decoder_input = args[0]
+        cp_group = self.pg_collection.cp
+        if (
+            self.mtp_process
+            and decoder_input is not None
+            and kwargs.get("packed_seq_params") is None
+            and cp_group.size() > 1
+        ):
+            input_ids = split_data_cp_rank(
+                input_ids,
+                cp_group.size(),
+                seq_dim=1,
+                cp_rank=cp_group.rank(),
+            )
+        return original_forward(
+            self, input_ids, position_ids, attention_mask, *args, **kwargs
+        )
+
+    Qwen3VLGPTModel.forward = _patched_forward
+    Qwen3VLGPTModel._areal_mtp_cp_input_ids_applied = True
+    logger.info(
+        "Applied megatron-bridge Qwen3-VL MTP CP input_ids alignment workaround."
+    )
+
+
 def _patch_moe_aux_loss_backward_scale() -> None:
     """Reconcile mcore's MoE aux-loss backward scaling with AReaL's manual
     loss normalization.
@@ -199,6 +254,7 @@ def _patch_moe_aux_loss_backward_scale() -> None:
 def _apply_patches_on_import() -> None:
     _silence_mcore_gdn_indexing_deprecation()
     _patch_qwen3vl_pr3143_word_embeddings()
+    _patch_qwen3vl_mtp_cp_input_ids()
     _patch_moe_aux_loss_backward_scale()
 
 
