@@ -16,6 +16,19 @@ from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 logger = logging.getLogger("Dataset")
 
 
+def validate_single_sequence_microbatches(config: SFTConfig) -> None:
+    """Keep this CP example on the one-sequence-per-forward validation path."""
+    batch_size = config.train_dataset.batch_size
+    n_mbs = config.actor.mb_spec.n_mbs
+    if n_mbs != batch_size:
+        raise ValueError(
+            "This Qwen3.6 VLM CP SFT example requires "
+            "actor.mb_spec.n_mbs to equal train_dataset.batch_size so each "
+            "Megatron micro-batch contains exactly one sequence; got "
+            f"n_mbs={n_mbs}, batch_size={batch_size}."
+        )
+
+
 class SyntheticLongVLMDataset(Dataset):
     """Deterministic image-text SFT data for CP consistency validation."""
 
@@ -231,6 +244,7 @@ class SyntheticLongVLMDataset(Dataset):
 
 def main(args: list[str]) -> None:
     config, _ = load_expr_config(args, SFTConfig)
+    validate_single_sequence_microbatches(config)
     processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
 
     train_dataset = SyntheticLongVLMDataset(
