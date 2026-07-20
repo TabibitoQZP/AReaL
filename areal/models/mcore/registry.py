@@ -14,6 +14,7 @@ from megatron.core.transformer import TransformerConfig
 from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.cli_args import MegatronEngineConfig
+from areal.engine.core.model import is_qwen3_5_model
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -214,6 +215,12 @@ def make_mcore_model(
         )
         provider.sequence_parallel = mpu.get_tensor_model_parallel_world_size() > 1
         provider.pipeline_dtype = tf_config.params_dtype
+        if provider.context_parallel_size > 1 and is_qwen3_5_model(
+            hf_config.model_type
+        ):
+            # Required by Megatron-Bridge for CP fine-tuning. AReaL normalizes
+            # its externally computed loss by the global token weight.
+            provider.calculate_per_token_loss = True
 
         provider.recompute_granularity = mcore_config.recompute_granularity
         provider.recompute_method = mcore_config.recompute_method
@@ -263,6 +270,7 @@ def make_mcore_model(
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
+        tf_config.calculate_per_token_loss = provider.calculate_per_token_loss
 
         provider.finalize()
 

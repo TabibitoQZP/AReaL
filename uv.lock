@@ -24,7 +24,7 @@ overrides = [
     { name = "flash-attn-4", specifier = ">=4.0.0b4" },
     { name = "hydra-core", specifier = "==1.4.0.dev1" },
     { name = "mamba-ssm", marker = "sys_platform == 'never'" },
-    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.17.0" },
+    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.18.0" },
     { name = "nv-grouped-gemm", marker = "sys_platform == 'never'" },
     { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==9.16.0.29" },
     { name = "nvidia-resiliency-ext", marker = "sys_platform == 'never'" },
@@ -511,7 +511,7 @@ requires-dist = [
     { name = "matplotlib" },
     { name = "mbridge", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/ISEEKYAN/mbridge.git?rev=310e8fb" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.4.0" },
-    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.17.0" },
+    { name = "megatron-core", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.18.0" },
     { name = "mistral-common", specifier = ">=1.11.1" },
     { name = "msgspec" },
     { name = "networkx", specifier = "==3.3" },
@@ -3305,17 +3305,17 @@ wheels = [
 
 [[package]]
 name = "megatron-core"
-version = "0.17.0"
+version = "0.18.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "packaging", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torch", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bc/89/f690c7d282200d6e36078f4bfbb9e6862102105c062fbf9b518c5b72df38/megatron_core-0.17.0.tar.gz", hash = "sha256:ff66c206ed164bc602ff00310388605fac41f284262176e17246a9e94163b205", size = 1385595, upload-time = "2026-04-16T20:22:32.079Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/5f/31dbdff0e758598050fbee8bacad0f034447817db34b6399100acd5d3929/megatron_core-0.18.0.tar.gz", hash = "sha256:8feff0cd371e5ef26dc36636a23e197983ddddf10b43847871697b89be8cd6ea", size = 1602287, upload-time = "2026-06-23T00:15:45.679Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/75/32/b4b48af9008d842732461f34373c67b6611ff7e709672eaab07e26e3a6d2/megatron_core-0.17.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fce43a871881fd8ff0b33a68d4c1653447e2d878eaeb9f91004f2238fe814f15", size = 1723570, upload-time = "2026-04-16T20:22:25.831Z" },
-    { url = "https://files.pythonhosted.org/packages/4e/ad/1c15b4078ad9fc99ba347e112bdf5082d182473f729d906e0c99b8a1f5fb/megatron_core-0.17.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0cbacf043603f9dc2735310e1b1dcd5c076c02caab13849c2d2fe6a99cbea4f6", size = 1725087, upload-time = "2026-04-16T20:22:27.517Z" },
+    { url = "https://files.pythonhosted.org/packages/46/83/b5deadc8cf7d62e6f89d0d191e51c0d1fc9c4aff95d68c4c27392edf44dc/megatron_core-0.18.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:429eddb2c6ce003099cf7d2130081eeba29fdcc5292654fec7fffa0f2894d559", size = 1965609, upload-time = "2026-06-23T00:15:40.219Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/15/44d3ed47df82ba40be75965d26cee8230ab7ab54f9cbfa39b668544c75eb/megatron_core-0.18.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:beb6f7b1462a82723cef31773dae60f54a2f7bc809e5e050cf9f59c344b5a373", size = 1967128, upload-time = "2026-06-23T00:15:41.937Z" },
 ]
 
 [[package]]

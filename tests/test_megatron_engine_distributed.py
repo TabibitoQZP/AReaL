@@ -188,6 +188,20 @@ def test_qwen3_5_tensor_parallel(tmp_path_factory):
 
 @pytest.mark.multi_gpu
 @pytest.mark.slow
+def test_qwen3_5_context_parallel_train(tmp_path_factory):
+    if current_platform.device_count() < 2:
+        pytest.skip("context parallel requires 2 GPUs to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_cp_train.out"
+    _run_test_with_torchrun(
+        "qwen3_5",
+        "megatron:d1p1t1c2",
+        test_type="train",
+        output=str(output),
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
 def test_qwen3_5_pipeline_parallel(tmp_path_factory):
     if current_platform.device_count() < 2:
         pytest.skip("pipeline parallel requires 2 GPUs to run")
@@ -273,8 +287,8 @@ def test_qwen3_5_hf_save_load(tmp_path_factory):
 # exercised with expert parallelism.
 #
 # Parallelism constraints for this model:
-#   * Context parallel is unavailable for the Qwen3.5 series (GDN/SSM layers
-#     reject packed sequences; see Megatron-LM #4043 and the VLM-CP guard).
+#   * Context parallel requires Megatron Core >= 0.18 and uses the padded path
+#     so Megatron-Bridge can perform its own sequence sharding.
 #   * The full-attention layers have num_query_groups=2, so TP <= 2.
 #   * Ranks are therefore filled with PP (and DP, for the optimizer), at EP=2.
 #
@@ -290,9 +304,9 @@ def test_qwen3_5_hf_save_load(tmp_path_factory):
 def test_qwen3_5_moe_expert_parallel(tmp_path_factory):
     """Qwen3.5-MoE megatron forward under PP=2 / TP=2 / EP=2.
 
-    The MoE analog of ``test_qwen3moe_expert_parallel``. CP is unavailable for
-    the GDN layers and the full-attention layers cap TP at 2, so the 4 ranks are
-    filled with PP=2 and experts run at EP=2. The megatron-vs-FSDP cross-check is
+    The MoE analog of ``test_qwen3moe_expert_parallel``. This test focuses on
+    PP/TP/EP; context parallelism is covered by the Qwen3.6 SFT smoke example.
+    The 4 ranks use PP=2, TP=2, and EP=2. The megatron-vs-FSDP cross-check is
     skipped for this model (see ``_MODEL_SKIP_FSDP_COMPARE``) because a 35B-A3B
     FSDP replica cannot co-reside with the megatron model. This validates engine
     init + GDN BSHD forward + cross-rank logprob consistency; weight-conversion

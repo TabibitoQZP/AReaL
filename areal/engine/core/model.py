@@ -88,9 +88,9 @@ def is_qwen3_5_model(model_type: str) -> bool:
 def requires_padded_seq(model_type: str) -> bool:
     """Whether the model must run the padded (BSHD) forward instead of packed (THD).
 
-    GDN/SSM models (currently the Qwen3.5 family) reject packed sequences in their
-    attention/SSM kernels, so they must run on padded ``[B, S]`` input. THD stays
-    the default for every other model.
+    Qwen3.5/3.6 currently use the padded path because their Megatron-Bridge model
+    owns the BSHD-to-CP conversion. Sending AReaL's pre-sharded THD input would
+    apply packed preprocessing twice. THD stays the default for other models.
     """
     return is_qwen3_5_model(model_type)
 
