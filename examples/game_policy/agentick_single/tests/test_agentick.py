@@ -7,24 +7,27 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import agent
+import env_runner
+import evaluator
 import pytest
-
-from examples.game_policy import agent, env_runner, evaluator
-from examples.game_policy.env_runner import (
+from env_runner import (
     PolicyError,
     PolicyProcess,
     policy_observation,
 )
-from examples.game_policy.policy_worker import compile_policy, validate_result
-from examples.game_policy.prepare_data import (
+from policy_worker import compile_policy, validate_result
+from prepare_data import (
     INITIAL_POLICIES,
     SMOKE_POLICY,
     seed_groups,
 )
+from rl_client import Session
 
 
 def sample() -> dict:
     return {
+        "id": "test-sample",
         "task": "GoToGoal-v0",
         "difficulty": "easy",
         "previous_policy": INITIAL_POLICIES[0],
@@ -238,39 +241,59 @@ def test_outer_timeout_kills_environment_process(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("output, expected", [(INITIAL_POLICIES[0], 0.75), ("", 0.0)])
-def test_agent_calls_actor_once_and_returns_scalar(
+def test_candidate_waits_for_group_before_submitting_reward(
     monkeypatch, output, expected
 ) -> None:
     """Exactly one captured actor completion generates one candidate reward."""
-    create = AsyncMock(
-        return_value=SimpleNamespace(
-            choices=[
-                SimpleNamespace(message=SimpleNamespace(content=output)),
-            ]
-        )
-    )
     client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        generate=AsyncMock(return_value=("completion-1", output)),
+        set_reward=AsyncMock(return_value={"trajectory_id": 0}),
     )
-    received = {}
-
-    def make_client(**kwargs):
-        received.update(kwargs)
-        return client
-
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=make_client))
     evaluate = AsyncMock(return_value={"reward": 0.75})
     monkeypatch.setattr(agent, "evaluate_policy", evaluate)
+    session = Session("session-1", "test-session-key")
     result = asyncio.run(
-        agent.AgentickPolicyAgent(max_completion_tokens=2048).run(
-            sample(),
-            base_url="http://test.invalid",
-            api_key="test-session",
-            http_client=object(),
+        agent.evaluate_candidate(client, session, sample(), AsyncMock())
+    )
+    assert result["evaluation"]["reward"] == expected
+    client.generate.assert_awaited_once()
+    client.set_reward.assert_not_awaited()
+    assert evaluate.await_count == bool(output)
+
+
+def test_environment_failure_does_not_submit_zero_reward(monkeypatch) -> None:
+    """Deployment failures leave the trajectory unscored for operator review."""
+    client = SimpleNamespace(
+        generate=AsyncMock(return_value=("completion-1", INITIAL_POLICIES[0])),
+        set_reward=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        agent,
+        "evaluate_policy",
+        AsyncMock(side_effect=RuntimeError("Environment failed")),
+    )
+    with pytest.raises(RuntimeError, match="Environment failed"):
+        asyncio.run(
+            agent.evaluate_candidate(
+                client, Session("sid", "key"), sample(), AsyncMock()
+            )
+        )
+    client.set_reward.assert_not_awaited()
+
+
+def test_environment_process_does_not_inherit_driver_credentials(monkeypatch) -> None:
+    """The trusted runner receives only its minimal CPU environment."""
+    monkeypatch.setenv("AREAL_ROLLOUT_ADMIN_KEY", "private-admin")
+    monkeypatch.setenv("OPENAI_API_KEY", "private-session")
+    launch = AsyncMock(
+        return_value=SimpleNamespace(
+            returncode=0,
+            communicate=AsyncMock(return_value=(b'{"success": false}', b"")),
         )
     )
-    assert type(result) is float and result == expected
-    create.assert_awaited_once()
-    assert received["api_key"] == "test-session"
-    assert received["max_retries"] == 0
-    assert evaluate.await_count == bool(output)
+    monkeypatch.setattr(evaluator.asyncio, "create_subprocess_exec", launch)
+    asyncio.run(evaluator.evaluate_policy(INITIAL_POLICIES[0], [1]))
+    environment = launch.call_args.kwargs["env"]
+    assert "AREAL_ROLLOUT_ADMIN_KEY" not in environment
+    assert "OPENAI_API_KEY" not in environment
+    assert environment["CUDA_VISIBLE_DEVICES"] == ""

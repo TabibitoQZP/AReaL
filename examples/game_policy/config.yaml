@@ -1,9 +1,12 @@
-experiment_name: agentick-policy-grpo
+experiment_name: agentick-policy-online
 trial_name: trial1
 
 seed: 1
 enable_offload: false
 total_train_epochs: 3
+# Online mode counts completed trajectories, not dataset passes.
+# 32 prompts x 3 passes x 4 candidates = 384 trajectories = 24 updates.
+total_train_steps: 24
 tokenizer_path: ${actor.path}
 
 cluster:
@@ -16,10 +19,11 @@ cluster:
     nfs_record_root: /tmp/areal/name_resolve
 
 scheduler:
-  type: null
+  type: local
 
 rollout:
-  _version: v1
+  _version: v2
+  admin_api_key: ${oc.env:AREAL_ROLLOUT_ADMIN_KEY}
   backend: "sglang:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -33,22 +37,26 @@ rollout:
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
   agent:
-    mode: inline
+    mode: online
     tool_call_parser: qwen25
     reasoning_parser: ""
     chat_template_type: hf
     export_style: individual
     turn_discount: 1.0
+    set_reward_finish_timeout: 0.0
 
 gconfig:
-  n_samples: 4
+  # Each HTTP session is one trajectory; candidate groups live in the client.
+  n_samples: 1
+  reward_normalization: false
   min_new_tokens: 0
   max_new_tokens: 2048
   greedy: false
   temperature: 1.0
 
 actor:
-  _version: v1
+  _version: v2
+  admin_api_key: ${oc.env:AREAL_ACTOR_ADMIN_KEY}
   backend: "fsdp:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -72,7 +80,12 @@ actor:
   eps_clip: 0.4
   temperature: ${gconfig.temperature}
   reward_scaling: 1.0
+  # Client supplies group-relative advantages via the reward endpoint.
   reward_bias: 0.0
+  # Finite for JSON transport, above any practical group-relative advantage.
+  reward_clip: 1000000.0
+  discount: 1.0
+  gae_lambda: 1.0
   kl_ctl: 0.0
   ppo_n_minibatches: 1
   recompute_logprob: true
@@ -80,13 +93,8 @@ actor:
   rejection_sampling:
     metric: ratio
     upper: 5.0
-  reward_norm:
-    mean_level: group
-    std_level: group
-    group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: batch
+  reward_norm: null
+  adv_norm: null
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
@@ -96,21 +104,8 @@ actor:
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars: {}
 
-ref:
-  backend: ${actor.backend}
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  path: ${actor.path}
-  init_from_scratch: false
-  disable_dropout: true
-  dtype: ${actor.dtype}
-  mb_spec:
-    max_tokens_per_mb: 4096
-  optimizer: null
-  scheduling_strategy:
-    type: colocation
-    target: actor
-  scheduling_spec: ${actor.scheduling_spec}
+ref: null
+critic: null
 
 sglang:
   model_path: ${actor.path}
@@ -123,19 +118,13 @@ sglang:
   enable_multimodal: false
 
 train_dataset:
-  batch_size: 4
-  shuffle: true
-  pin_memory: true
-  num_workers: 4
-  path: examples/game_policy/data/goto_goal
+  # Only the batch size is used. The service does not read task data.
+  # Default client: 4 prompts x 4 candidates per update.
+  batch_size: 16
+  path: "null"
   type: rl
 
-valid_dataset:
-  batch_size: 4
-  pin_memory: true
-  num_workers: 4
-  path: ${train_dataset.path}
-  type: rl
+valid_dataset: null
 
 saver:
   experiment_name: ${experiment_name}

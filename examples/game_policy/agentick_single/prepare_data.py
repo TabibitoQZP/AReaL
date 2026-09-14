@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .evaluator import evaluate_policy
+from evaluator import evaluate_policy
 
 # Deliberately incomplete policies. Their feedback is measured, never fabricated.
 INITIAL_POLICIES = (
@@ -66,7 +66,7 @@ async def build_rows(
                 "task": "GoToGoal-v0",
                 "difficulty": "easy",
                 "previous_policy": previous_policy,
-                # JSON avoids heterogeneous Arrow structs for diagnostic data.
+                # Keep feedback serialized, matching the actor prompt input.
                 "previous_feedback": json.dumps(feedback),
                 "feedback_seeds": feedback_seeds,
                 "evaluation_seeds": evaluation_seeds,
@@ -76,8 +76,6 @@ async def build_rows(
 
 
 async def prepare(args: argparse.Namespace) -> None:
-    from datasets import Dataset, DatasetDict
-
     output = Path(args.output)
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite existing dataset: {output}")
@@ -101,14 +99,16 @@ async def prepare(args: argparse.Namespace) -> None:
         args.seeds_per_policy,
         args.start_seed,
     )
-    DatasetDict(
-        {"train": Dataset.from_list(train), "test": Dataset.from_list(valid)}
-    ).save_to_disk(str(output))
+    output.mkdir(parents=True)
+    for name, rows in (("train", train), ("valid", valid)):
+        with (output / f"{name}.jsonl").open("x", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
     manifest = {
         "task": "GoToGoal-v0",
         "difficulty": "easy",
         "train_size": len(train),
-        "test_size": len(valid),
+        "valid_size": len(valid),
         "seeds_per_policy": args.seeds_per_policy,
         "start_seed": args.start_seed,
         "smoke_check": smoke,
@@ -118,7 +118,7 @@ async def prepare(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", default="examples/game_policy/data/goto_goal")
+    parser.add_argument("--output", default="data/goto_goal")
     parser.add_argument("--train-size", type=int, default=32)
     parser.add_argument("--valid-size", type=int, default=8)
     parser.add_argument("--seeds-per-policy", type=int, default=4)

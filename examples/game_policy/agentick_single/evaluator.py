@@ -38,7 +38,7 @@ async def evaluate_policy(
         raise ValueError("Require 0 < action_timeout < trial_timeout")
     trials = []
     for seed in seeds:
-        # Sequential seeds bound CPU use; AReaL controls candidate concurrency.
+        # Sequential seeds bound CPU use; the standalone driver limits candidates.
         request = {
             "code": code,
             "task": task,
@@ -54,7 +54,10 @@ async def evaluate_policy(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             env={
-                **os.environ,
+                # Do not pass API credentials or CUDA visibility to task processes.
+                "PATH": os.environ.get("PATH", os.defpath),
+                "LANG": os.environ.get("LANG", "C.UTF-8"),
+                "CUDA_VISIBLE_DEVICES": "",
                 "SDL_VIDEODRIVER": "dummy",
                 "SDL_AUDIODRIVER": "dummy",
                 "PYGAME_HIDE_SUPPORT_PROMPT": "1",
