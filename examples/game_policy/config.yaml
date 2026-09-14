@@ -57,7 +57,7 @@ gconfig:
 actor:
   _version: v2
   admin_api_key: ${oc.env:AREAL_ACTOR_ADMIN_KEY}
-  backend: "fsdp:d4p1t1"
+  backend: "megatron:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-1.5B-Instruct
@@ -65,6 +65,13 @@ actor:
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
+  weight_update_mode: awex
+  # AWEX exports BF16 model parameters; Megatron keeps FP32 optimizer masters.
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      use_distributed_optimizer: true
   mb_spec:
     max_tokens_per_mb: 4096
   optimizer:

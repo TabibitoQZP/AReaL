@@ -38,6 +38,10 @@ python examples/game_policy/train.py --config examples/game_policy/config.yaml
 
 记录服务日志中的 inference gateway 地址。配置保留原来的单节点 8 GPU 布局，需按云端资源调整。
 
+共享配置采用 v2 Megatron 训练、SGLang 推理和 AWEX 权重同步。训练模型参数与推理 dtype 都为 BF16， Megatron 的分布式 Adam
+保留 FP32 优化器主权重和状态，梯度归约使用 FP32。 单节点 8 GPU 分配为 4 张训练、4 张推理，TP 和 PP 均为 1。 训练机器需具备仓库要求的
+Megatron/CUDA 依赖，参见[安装说明](../../../docs/en/tutorial/installation.md)； CPU 客户端仍仅安装本目录的依赖。
+
 **评测机器**：复制本目录，进入目录后直接运行脚本。没有本地 `agentick` Python 包或 `agentick.py` 文件，以免遮蔽第三方 Agentick。
 
 ```bash
