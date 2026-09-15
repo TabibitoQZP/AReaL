@@ -88,7 +88,33 @@ python examples/game_policy/train.py --config examples/game_policy/config.yaml \
 
 记录训练日志中的 inference gateway 地址。客户端和服务默认 temperature 都为 1；修改时保持一致。
 
-### 长度与采样约束
+### Qwen3-8B 与 thinking 输出
+
+本客户端支持 Qwen3-8B 默认模板生成的前置 `<think>...</think>`，以及已经由服务端拆分、 只在 `message.content`
+返回最终答案的接口。`agent.py` 仅对执行和下一轮反馈视图提取最终答案； 不修改 AReaL 核心、HTTP completion ID、原始生成 token 或
+reward 传播。 混合输出中的 thinking 保留在 JSONL `generated.output`，不会当作 Python 执行，也不会放进下一轮的
+`previous_policy`。 若服务端另行返回 `reasoning_content`，现有 RLClient 只读取 `content`，不会将独立
+reasoning 字段写入客户端日志； 训练 token 的保留仍由 AReaL 服务端负责。
+
+只接受一个闭合的前置 thinking 块；代码内部的同名字符串不删除。未闭合、嵌套或重复的前置块、 只有思考没有最终答案均视为无效候选：非末轮返回格式反馈，末轮 reward
+为 0，不回退历史策略。 `<think>...</think>STOP` 与普通 STOP 语义相同，仍须先有有效策略。 本适配针对本地核对过的 Qwen3-8B
+默认模板（不预填 `<think>` 开头），不是任意模型推理格式的通用解析器。
+
+可在上述完整训练命令中替换模型并增加输出预算，例如：
+
+```bash
+python examples/game_policy/train.py --config examples/game_policy/config.yaml \
+  experiment_name=agentick-policy-qwen3-8b total_train_steps=96 \
+  actor.path=Qwen/Qwen3-8B actor.backend=megatron:d2p1t2 \
+  gconfig.max_new_tokens=8192
+```
+
+客户端 train/eval 同时传 `--max-tokens 8192`，因为 thinking 与代码共享输出预算； 32K 输入加输出总上限仍保持不变。这里的 8192
+是初始配置建议，不保证任意任务都能完成思考。 无需为本适配开启 `reasoning_parser`：未拆分和已拆分的 content 均可处理。
+默认不强制非思考模式；若部署端改写模板或禁用 thinking，应重新检查返回格式。 Qwen3 架构已在 Megatron 注册，但该模型的显存峰值、AWEX
+同步和完整训练仍需目标机器 smoke 验证。
+
+### 总长度和采样一致性
 
 `gconfig.max_tokens=32768` 是一次请求的输入加输出上限，不是仅输出预算。 共享配置将
 `rollout.agent.engine_max_tokens`、`sglang.context_length` 和

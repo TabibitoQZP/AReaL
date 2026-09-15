@@ -22,7 +22,9 @@ logger = logging.getLogger("GamePolicy")
 Record = Callable[[dict], Awaitable[None]]
 PROTOCOL = """Write a Python policy for the Agentick task described by the user.
 Return a complete replacement policy: plain Python or exactly one Python fenced
-block, with no prose. Alternatively, output exactly STOP to retain the current
+block, with no prose in the final answer. If you use reasoning, put it in one
+leading <think>...</think> block, then give only the policy or STOP after it.
+Alternatively, output exactly STOP to retain the current
 policy and finish. STOP is allowed only after a policy has been produced.
 You have a limited number of LLM calls, including this call and any STOP call.
 Only your final policy is scored on fresh game instances; previous feedback is
@@ -52,6 +54,28 @@ the policy process has 30 CPU seconds per game and 256 MiB memory on Linux.
 Code is limited to 32 KiB. Available builtins: {builtins}.
 Allowed methods: {methods}.
 """.format(builtins=", ".join(BUILTIN_NAMES), methods=", ".join(sorted(METHOD_NAMES)))
+
+
+def policy_answer(output: str) -> str:
+    """Remove one leading Qwen3 reasoning block, not tags inside Python code.
+
+    Already-separated Chat Completions content is passed through. This changes
+    only the execution/feedback view: the recorded response and AReaL's original
+    generation tokens remain untouched. Incomplete reasoning is not executable.
+    """
+    answer = output.strip()
+    if not answer.startswith("<think>"):
+        return answer
+    reasoning, closed, answer = answer[len("<think>") :].partition("</think>")
+    if not closed:
+        raise ValueError("Unfinished <think> block; no final policy was produced")
+    if "<think>" in reasoning or answer.lstrip().startswith(("<think>", "</think>")):
+        raise ValueError(
+            "Expected one leading <think> block followed by a final answer"
+        )
+    if not answer.strip():
+        raise ValueError("Reasoning ended without a final policy or STOP")
+    return answer.strip()
 
 
 def build_messages(
@@ -147,17 +171,20 @@ async def refine(
                 "output": output,
             }
         )
-        if output.strip() == "STOP" and code is not None:
-            stop_reason = "stop"
-            break
         # A malformed replacement is the latest candidate, not a best-so-far fallback.
-        previous = output.encode()[:32_768].decode(errors="ignore")
+        # Do not echo an unfinished reasoning block as the previous policy.
+        previous = ""
         try:
-            if output.strip() == "STOP":
+            answer = policy_answer(output)
+            if answer == "STOP" and code is not None:
+                stop_reason = "stop"
+                break
+            previous = answer.encode()[:32_768].decode(errors="ignore")
+            if answer == "STOP":
                 raise ValueError(
                     "STOP requires an existing policy; generate code first"
                 )
-            code = extract_policy(output)
+            code = extract_policy(answer)
             error = ""
         except ValueError as exc:
             code = None
