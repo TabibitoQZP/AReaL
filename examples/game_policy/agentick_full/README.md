@@ -4,8 +4,10 @@
 [`config.yaml`](../config.yaml)。客户端不导入 AReaL、torch、datasets 或 OpenAI SDK。
 
 共享配置采用 v2 Megatron 训练、SGLang 推理和 AWEX 权重同步。模型参数和推理使用 BF16， Megatron 的分布式 Adam 保留 FP32
-优化器主权重和状态，梯度归约使用 FP32。 单节点 8 GPU 分配为 4 张训练、4 张推理，TP 和 PP 均为 1。 训练端需具备仓库要求的 Megatron/CUDA
-依赖，参见[安装说明](../../../docs/en/tutorial/installation.md)； 本目录的 CPU 客户端不依赖 Megatron。
+优化器主权重和状态，梯度归约使用 FP32。单节点 8 GPU 分配为 4 张训练、4 张推理。共享配置保留 1.5B、DP4/TP1 的轻量 smoke
+用途；下面的完整训练命令使用 Qwen2.5-Coder-7B-Instruct，训练 DP2/TP2、推理四个 TP1 副本，PP 均为 1。训练端需具备仓库要求的
+Megatron/CUDA 依赖，参见[安装说明](../../../docs/en/tutorial/installation.md)； 本目录的 CPU 客户端不依赖
+Megatron。
 
 ## 任务与数据
 
@@ -76,10 +78,70 @@ python prepare_data.py --output data/full
 ```bash
 python examples/game_policy/train.py --config examples/game_policy/config.yaml \
   experiment_name=agentick-policy-full total_train_steps=96 \
-  gconfig.max_new_tokens=4096 +rollout.agent.session_timeout_seconds=7200
+  actor.path=Qwen/Qwen2.5-Coder-7B-Instruct actor.backend=megatron:d2p1t2 \
+  gconfig.max_new_tokens=4096
 ```
 
+离线部署时，将 `actor.path` 替换为完整的本地 Hugging Face 模型目录；检查索引引用的权重分片均非空，不能仅检查目录存在。 1.5B
+能运行不代表能产生有效的策略或 reward。7B 的选择旨在改善代码生成与协议遵循能力，不保证在所有任务上都有学习信号。 DP2/TP2 降低单卡模型、梯度及 logits
+占用，但显存峰值还包括激活、优化器和 AWEX 导出缓冲；需要在目标硬件上验证。
+
 记录训练日志中的 inference gateway 地址。客户端和服务默认 temperature 都为 1；修改时保持一致。
+
+### Qwen3-8B 与 thinking 输出
+
+本客户端支持 Qwen3-8B 默认模板生成的前置 `<think>...</think>`，以及已经由服务端拆分、 只在 `message.content`
+返回最终答案的接口。`agent.py` 仅对执行和下一轮反馈视图提取最终答案； 不修改 AReaL 核心、HTTP completion ID、原始生成 token 或
+reward 传播。 混合输出中的 thinking 保留在 JSONL `generated.output`，不会当作 Python 执行，也不会放进下一轮的
+`previous_policy`。 若服务端另行返回 `reasoning_content`，现有 RLClient 只读取 `content`，不会将独立
+reasoning 字段写入客户端日志； 训练 token 的保留仍由 AReaL 服务端负责。
+
+只接受一个闭合的前置 thinking 块；代码内部的同名字符串不删除。未闭合、嵌套或重复的前置块、 只有思考没有最终答案均视为无效候选：非末轮返回格式反馈，末轮 reward
+为 0，不回退历史策略。 `<think>...</think>STOP` 与普通 STOP 语义相同，仍须先有有效策略。 本适配针对本地核对过的 Qwen3-8B
+默认模板（不预填 `<think>` 开头），不是任意模型推理格式的通用解析器。
+
+可在上述完整训练命令中替换模型并增加输出预算，例如：
+
+```bash
+python examples/game_policy/train.py --config examples/game_policy/config.yaml \
+  experiment_name=agentick-policy-qwen3-8b total_train_steps=96 \
+  actor.path=Qwen/Qwen3-8B actor.backend=megatron:d2p1t2 \
+  gconfig.max_new_tokens=8192
+```
+
+客户端 train/eval 同时传 `--max-tokens 8192`，因为 thinking 与代码共享输出预算； 32K 输入加输出总上限仍保持不变。这里的 8192
+是初始配置建议，不保证任意任务都能完成思考。 无需为本适配开启 `reasoning_parser`：未拆分和已拆分的 content 均可处理。
+默认不强制非思考模式；若部署端改写模板或禁用 thinking，应重新检查返回格式。 Qwen3 架构已在 Megatron 注册，但该模型的显存峰值、AWEX
+同步和完整训练仍需目标机器 smoke 验证。
+
+### 总长度和采样一致性
+
+`gconfig.max_tokens=32768` 是一次请求的输入加输出上限，不是仅输出预算。 共享配置将
+`rollout.agent.engine_max_tokens`、`sglang.context_length` 和
+`actor.mb_spec.max_tokens_per_mb` 都关联到这个值。完整任务的上一轮代码与反馈也是输入： 只允许输出 4096 tokens
+并不能让整条训练序列落在 4096 内。增大 context 时需同步评估显存，不能把 32K 配置视作任意长输入的保证。 这些字段现在已存在于
+YAML；旧启动脚本中用于新增字段的 `+gconfig.max_tokens=...`、 `+rollout.agent.engine_max_tokens=...`
+等应改为普通覆盖，不要继续用 Hydra 的 `+` 新增语法。
+
+共享配置同时开启 `rollout.deterministic_sampling` 与 `sglang.enable_deterministic_inference`。
+前者按候选的 task ID 和请求序号派生 seed，后者使 SGLang 实际使用请求 seed；只改全局 `random_seed` 或只创建独立
+session，不能防止多个同种子推理副本产生高度重复的候选。 客户端/凭据签发工具必须继续为每个候选使用不同的 task ID。同组候选共享游戏反馈/评分 seeds
+则是有意设计，应保留。 `max_head_offpolicyness=4` 保持不变，因此这里不承诺异步任务与权重版本映射的端到端确定性。 同样，旧脚本若用
+`+rollout.deterministic_sampling=...` 或 `+sglang.enable_deterministic_inference=...`
+新增字段，现在也应改为普通覆盖。
+
+### 低权限容器中的编译缓存
+
+SGLang 的 deterministic inference 可能启用 batch-invariant/DeepGEMM 计算路径。 镜像内编译缓存若默认指向
+`/root/.cache`，降权后的训练进程可能在初始化阶段报权限错误。 在最终训练 UID 下创建可写目录，并在启动训练服务前同时设置：
+
+```bash
+export SGLANG_DG_CACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agentick-deep-gemm.XXXXXX")"
+export DG_JIT_CACHE_DIR="$SGLANG_DG_CACHE_DIR"
+```
+
+容器运行时应在容器内创建该目录并传入这两个变量；不要引用不可见的宿主临时目录。 只需调整启动环境，不要求重新封镜像、改 HOME、开放 root 目录权限或让策略进程以
+root 执行。 目录由当前运行独占，结束后按部署环境的临时目录回收策略清理。其他 CUDA/Triton 缓存也应保持可写。
 
 默认训练量是 **384 组 × 4 个候选 = 1,536 个 session**，最多 6,144 次 LLM 调用。 当前 online 队列每次消费一个完整
 session 的导出结果，因此 batch size 16 对应 16 个候选， 正常接收全部结果时共 96 次更新。每次更新包含 16–64 条独立 LLM
@@ -91,7 +153,8 @@ session 的导出结果，因此 batch size 16 对应 16 个候选， 正常接�
 
 ```bash
 # 受信任环境；从 AREAL_ROLLOUT_ADMIN_KEY 读取管理密钥。
-python rl_client.py --gateway http://TRAINING_HOST:PORT --count 96 --output sessions-00.jsonl
+python rl_client.py --gateway http://TRAINING_HOST:PORT --count 96 \
+  --task-prefix full-batch-00 --output sessions-00.jsonl
 
 # 低权限评测环境；只需上述凭据文件，不需要管理密钥。
 python agent.py train --gateway http://TRAINING_HOST:PORT \
@@ -99,8 +162,10 @@ python agent.py train --gateway http://TRAINING_HOST:PORT \
   --sessions sessions-00.jsonl --output runs/train-00.jsonl
 ```
 
-后续批次 offset 为 24、48、…、360；每批领取新凭据并写入新日志。整个过程中训练服务持续运行。 凭据文件以 `0600`
-创建，交付时设置正确所有权。已评分或结果不明的 session 不得复用。
+后续批次 offset 为 24、48、…、360；每批使用不同的 `--task-prefix`（例如
+`full-batch-01`），领取新凭据并写入新日志。整个过程中训练服务持续运行。 凭据文件以 `0600` 创建，交付时设置正确所有权。已评分或结果不明的 session
+不得复用。 不要依赖 `rollout.agent.session_timeout_seconds` 管理 v2 服务的过期清理：当前 v2 data proxy
+没有接通这个配置。
 
 也可在受信任的驱动环境直接运行全量训练，让客户端逐组申请 session：
 
@@ -120,7 +185,9 @@ python agent.py eval --base-url http://FROZEN_HOST:PORT/v1 --model MODEL_NAME \
   --data data/full/test.jsonl --max-rounds 4 --output runs/eval-refine.jsonl
 ```
 
-`eval` 只调用 chat API，没有申请 session 或提交 reward 的路径。模型必须由部署端保持冻结。
+`eval` 只调用 chat API，没有申请 session 或提交 reward 的路径。模型必须由部署端保持冻结。 独立冻结服务没有 AReaL data proxy
+自动派生请求 seed；不要仅复制训练的 deterministic inference 开关而不传独立请求 seed， 否则 SGLang 的默认 seed
+可能让重复题生成相同候选。使用该开关做配对评测时，应由评测启动层按题目 ID、候选编号及轮次显式传 seed；否则保持冻结服务的非 deterministic 采样模式。
 训练命令拒绝测试任务，评测命令只接受固定测试集任务。`--samples` 可增加每条数据的独立候选数， 结果取平均，不根据测试分数挑最佳候选。
 
 比较三个条件：未训练 checkpoint + `--max-rounds 1`、未训练 checkpoint + `--max-rounds 4`、 训练后
