@@ -1,0 +1,218 @@
+experiment_name: agentick-policy-async
+trial_name: qwen35-9b
+
+seed: 1
+enable_offload: true
+total_train_epochs: 1
+# 384 rows / 8 groups per batch = 48 updates per epoch (without dropped groups).
+total_train_steps: null
+tokenizer_path: ${actor.path}
+
+cluster:
+  # Single node, 8 H200. Actor and rollout share all eight GPUs.
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: ${oc.env:FILEROOT}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve
+
+scheduler:
+  type: local
+
+rollout:
+  _version: v1
+  backend: "sglang:d4p1t2"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  # Group concurrency, divided across the four inference DP replicas.
+  max_concurrent_rollouts: 32
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 3
+  # Derive a distinct request seed from each candidate's task ID and turn.
+  # This controls sampling, not async task-to-weight-version reproducibility.
+  deterministic_sampling: true
+  enable_rollout_tracing: false
+  scheduling_strategy:
+    type: colocation
+    target: actor
+    fork: true
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  agent:
+    mode: inline
+    admin_api_key: ${oc.env:AREAL_PROXY_ADMIN_KEY}
+    tool_call_parser: qwen25
+    reasoning_parser: qwen3
+    session_timeout_seconds: 14400
+    chat_template_type: hf
+    export_style: individual
+    turn_discount: 1.0
+    set_reward_finish_timeout: 0.0
+    engine_max_tokens: ${gconfig.max_tokens}
+
+gconfig:
+  # One dataset row is one group; each candidate owns a multi-call session.
+  n_samples: 4
+  reward_normalization: true
+  drop_incomplete_group: true
+  min_new_tokens: 0
+  max_new_tokens: 8192
+  # Leave one token below the SGLang context ceiling.
+  max_tokens: 32767
+  greedy: false
+  temperature: 1.0
+
+actor:
+  _version: v1
+  backend: "megatron:d4p1t2c1e1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${oc.env:MODEL_PATH,Qwen/Qwen3.5-9B}
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  weight_update_mode: awex
+  # AWEX exports BF16 model parameters; Megatron keeps FP32 optimizer masters.
+  megatron:
+    bridge_type: megatron-bridge
+    enable_mtp: false
+    enable_fp32_lm_head: false
+    cross_entropy_loss_fusion: false
+    wrap_with_ddp: true
+    ddp:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      grad_reduce_in_fp32: true
+      use_distributed_optimizer: true
+  mb_spec:
+    # A complete prompt + completion must fit; previous code/feedback are inputs.
+    n_mbs: 4
+    n_mbs_divisor: 1
+    granularity: 1
+    max_tokens_per_mb: 32768
+  optimizer:
+    type: adam
+    lr: 2e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  # Groups are normalized once by the inline grouped workflow.
+  reward_bias: 0.0
+  # Finite for JSON transport, above any practical group-relative advantage.
+  reward_clip: 1000000.0
+  discount: 1.0
+  gae_lambda: 1.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
+  reward_norm: null
+  adv_norm: null
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 8
+      mem: 64
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        AGENTICK_SERVICE_KEY: ${oc.env:AGENTICK_SERVICE_KEY}
+        TMS_INIT_ENABLE: "0"
+        TMS_INIT_ENABLE_CPU_BACKUP: "0"
+        # AWEX memory-saver remapping cannot use expandable segments.
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+        PYTORCH_ALLOC_CONF: "expandable_segments:False"
+
+ref: null
+critic: null
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  # SGLang otherwise ignores request-level sampling seeds.
+  enable_deterministic_inference: true
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: 16
+  context_length: 32768
+  mem_fraction_static: 0.6
+  enable_memory_saver: true
+  enable_multimodal: true
+  attention_backend: flashinfer
+  mm_attention_backend: flashinfer_cudnn
+  mamba_scheduler_strategy: extra_buffer
+  mamba_ssm_dtype: bfloat16
+  max_mamba_cache_size: 64
+  disable_radix_cache: false
+  enable_cache_report: true
+  disable_cuda_graph: true
+
+train_dataset:
+  # Batch size counts groups, not calls or individual candidate sessions.
+  batch_size: 8
+  path: ${oc.env:AGENTICK_TRAIN_DATA}
+  type: rl
+  shuffle: true
+  num_workers: 0
+  pin_memory: false
+
+# Held-out evaluation uses the same service, with AReaL is_eval sessions.
+# Replace null with a ValidDatasetConfig mapping to enable (see README),
+# or evaluate a separately served frozen checkpoint.
+valid_dataset: null
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

@@ -1,0 +1,4 @@
+# Standalone CPU execution-service dependencies; no AReaL installation is needed.
+# Keep the upstream API stable; no Agentick LLM/VLM extras are needed.
+agentick @ git+https://github.com/roger-creus/agentick.git@ddbad3b205e6aa331a7d985873df6cbd5f381600
+aiohttp>=3.13.3,<4
