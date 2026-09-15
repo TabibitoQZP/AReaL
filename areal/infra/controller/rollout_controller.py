@@ -52,6 +52,86 @@ from ..workflow_executor import BatchTaskDispatcher, TaskIdGenerator
 logger = logging.getLogger("RolloutController")
 
 
+def _merge_worker_stats(
+    all_raw_stats: list[dict[str, float]],
+) -> dict[str, float]:
+    """Merge independently aggregated stats from rollout workers.
+
+    Scalar means carry a ``__count`` companion. Distributions using the
+    ``<base>_count`` convention retain weighted averages and extrema. PRM
+    count/sum metrics have explicit SUM semantics; omit other tensor metrics
+    whose reduction or denominator cannot be determined from the export.
+    """
+    sums = defaultdict(float)
+    scalar_weighted_sums = defaultdict(float)
+    scalar_counts = defaultdict(float)
+    distribution_weighted_sums = defaultdict(float)
+    distribution_counts = defaultdict(float)
+    distribution_mins: dict[str, float] = {}
+    distribution_maxes: dict[str, float] = {}
+
+    for raw_stats in all_raw_stats:
+        for key, value in raw_stats.items():
+            if key.endswith("__count"):
+                continue
+
+            scalar_count_key = f"{key}__count"
+            if scalar_count_key in raw_stats:
+                count = raw_stats[scalar_count_key]
+                scalar_weighted_sums[key] += value * count
+                scalar_counts[key] += count
+                continue
+
+            base, separator, reduction = key.rpartition("/")
+            distribution_count_key = f"{base}_count"
+            if (
+                separator
+                and reduction in {"avg", "min", "max"}
+                and distribution_count_key in raw_stats
+            ):
+                count = raw_stats[distribution_count_key]
+                if count <= 0:
+                    continue
+                if reduction == "avg":
+                    distribution_weighted_sums[key] += value * count
+                    distribution_counts[key] += count
+                elif reduction == "min":
+                    distribution_mins[key] = min(
+                        value, distribution_mins.get(key, value)
+                    )
+                else:
+                    distribution_maxes[key] = max(
+                        value, distribution_maxes.get(key, value)
+                    )
+                continue
+
+            metric_key = key.removeprefix("rollout/").removeprefix("eval-rollout/")
+            segments = metric_key.split("/")
+            is_prm_sum = (
+                len(segments) == 5
+                and segments[0] == "prm_metric"
+                and segments[1] in {"turn", "trajectory"}
+                and segments[-1] in {"count", "sum", "observed_count"}
+            )
+            is_distribution_count = key.endswith("_count") and any(
+                f"{key.removesuffix('_count')}/{reduction}" in raw_stats
+                for reduction in ("avg", "min", "max")
+            )
+            if is_prm_sum or is_distribution_count:
+                sums[key] += value
+
+    merged = dict(sums)
+    for key, weighted_sum in scalar_weighted_sums.items():
+        if scalar_counts[key] > 0:
+            merged[key] = weighted_sum / scalar_counts[key]
+    for key, weighted_sum in distribution_weighted_sums.items():
+        if distribution_counts[key] > 0:
+            merged[key] = weighted_sum / distribution_counts[key]
+    merged.update(distribution_mins)
+    merged.update(distribution_maxes)
+    return merged
+
+
 # NOTE: remote task input has a slightly different
 # type annotation, which disallows workflow object or types
 @dataclass
@@ -1337,23 +1417,18 @@ class RolloutController:
 
     def export_stats(self) -> dict[str, float]:
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)
-        stats = defaultdict(float)
-        counts = defaultdict(int)
-
-        for raw_stats in all_raw_stats:
-            for k, v in raw_stats.items():
-                if k.endswith("__count"):
-                    counts[k] += v
-                else:
-                    stats[k] += v * raw_stats.get(k + "__count", 0)
-
-        # Average non-count stats
-        final_stats = {}
-        for k, v in stats.items():
-            count_key = k + "__count"
-            if count_key in counts and counts[count_key] > 0:
-                final_stats[k] = v / counts[count_key]
-        return final_stats
+        agent_config = self.config.agent
+        if (
+            self._proxy_started
+            and self.proxy_workers
+            and agent_config is not None
+            and agent_config.prm.enabled
+            and any(scorer.enabled for scorer in agent_config.prm.scorers)
+        ):
+            all_raw_stats += self._proxy_collective_rpc(
+                method="export_stats", http_timeout=60.0
+            )
+        return _merge_worker_stats(all_raw_stats)
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():
