@@ -157,6 +157,10 @@ sglang:
   enable_memory_saver: true
   enable_multimodal: true
   attention_backend: flashinfer
+  # Bound deterministic FlashInfer prefill workspace. SGLang 0.5.10.post1
+  # aligns intermediate chunks to its 4096-token prefill split tile.
+  chunked_prefill_size: 4096
+  max_prefill_tokens: 4096
   mm_attention_backend: flashinfer_cudnn
   mamba_scheduler_strategy: extra_buffer
   mamba_ssm_dtype: bfloat16

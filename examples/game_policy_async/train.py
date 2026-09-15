@@ -34,6 +34,31 @@ def validate_colocation(config, actor, rollout) -> None:
         raise ValueError("Local colocation must fit on one node without GPU reuse")
 
 
+def validate_prefill(config) -> None:
+    """Reject chunk budgets that stall deterministic FlashInfer prefill."""
+    sglang = config.sglang
+    if (
+        not sglang.enable_deterministic_inference
+        or sglang.attention_backend != "flashinfer"
+    ):
+        return
+    alignment = int(os.environ.get("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", "4096"))
+    if alignment <= 0:
+        raise ValueError("FlashInfer prefill split tile size must be positive")
+    chunk = sglang.chunked_prefill_size
+    if chunk < alignment or chunk % alignment:
+        raise ValueError(
+            "Deterministic FlashInfer requires chunked_prefill_size to be a "
+            f"positive multiple of the prefill split tile size ({alignment}); "
+            "smaller chunks can stall long requests, and unchunked prefill "
+            "can overflow the attention workspace"
+        )
+    if sglang.max_prefill_tokens < alignment:
+        raise ValueError(
+            f"Deterministic FlashInfer requires max_prefill_tokens >= {alignment}"
+        )
+
+
 def proxy_generation_kwargs(gconfig) -> dict:
     """Parameters for raw HTTP to AReaL, not an OpenAI SDK call."""
     return {
@@ -53,6 +78,7 @@ def main(args: list[str]) -> None:
     from areal.api.cli_args import PPOConfig, load_expr_config
 
     config, _ = load_expr_config(args, PPOConfig)
+    validate_prefill(config)
     validate_colocation(
         config,
         ModelAllocation.from_str(config.actor.backend).parallel,

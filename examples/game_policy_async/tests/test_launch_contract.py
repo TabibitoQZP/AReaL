@@ -16,6 +16,7 @@ from examples.game_policy_async.tasks import AGENTICK_REVISION
 from examples.game_policy_async.train import (
     proxy_generation_kwargs,
     validate_colocation,
+    validate_prefill,
 )
 
 
@@ -33,6 +34,57 @@ def config(monkeypatch, tmp_path):
     # Filled by GenerationHyperparameters when the real PPOConfig is loaded.
     cfg.gconfig.setdefault("top_p", 1.0)
     return cfg
+
+
+@pytest.mark.parametrize("chunk", [4096, 8192])
+def test_deterministic_prefill_aligned_chunks_pass(config, monkeypatch, chunk):
+    """The recipe admits at least one full default FlashInfer split tile."""
+    monkeypatch.delenv("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", raising=False)
+    assert (
+        config.sglang.chunked_prefill_size == config.sglang.max_prefill_tokens == 4096
+    )
+    config.sglang.chunked_prefill_size = chunk
+    validate_prefill(config)
+
+
+@pytest.mark.parametrize("chunk", [-1, 0, 2048, 6144])
+def test_deterministic_prefill_unsafe_chunks_rejected(config, monkeypatch, chunk):
+    """Reject unchunked prefill, the reproduced 2048 stall and misalignment."""
+    monkeypatch.delenv("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", raising=False)
+    config.sglang.chunked_prefill_size = chunk
+    with pytest.raises(ValueError, match="chunked_prefill_size"):
+        validate_prefill(config)
+
+
+def test_deterministic_prefill_small_budget_rejected(config, monkeypatch):
+    """Do not configure a token budget smaller than one attention tile."""
+    monkeypatch.delenv("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", raising=False)
+    config.sglang.max_prefill_tokens = 2048
+    with pytest.raises(ValueError, match="max_prefill_tokens"):
+        validate_prefill(config)
+
+
+def test_deterministic_prefill_custom_alignment_checked(config, monkeypatch):
+    """Use the same tile override as SGLang instead of hardcoding validation."""
+    monkeypatch.setenv("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", "8192")
+    with pytest.raises(ValueError, match="chunked_prefill_size"):
+        validate_prefill(config)
+    config.sglang.chunked_prefill_size = config.sglang.max_prefill_tokens = 8192
+    validate_prefill(config)
+    monkeypatch.setenv("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", "0")
+    with pytest.raises(ValueError, match="positive"):
+        validate_prefill(config)
+
+
+@pytest.mark.parametrize(
+    "deterministic,backend", [(False, "flashinfer"), (True, "triton")]
+)
+def test_other_prefill_modes_not_restricted(config, deterministic, backend):
+    """Do not impose FlashInfer's deterministic contract on other modes."""
+    config.sglang.enable_deterministic_inference = deterministic
+    config.sglang.attention_backend = backend
+    config.sglang.chunked_prefill_size = -1
+    validate_prefill(config)
 
 
 def test_colocation_eight_single_gpu_workers_pass(config):
