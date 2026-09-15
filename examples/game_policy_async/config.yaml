@@ -22,10 +22,12 @@ scheduler:
 
 rollout:
   _version: v1
-  backend: "sglang:d4p1t2"
+  # Forked colocation requires one inference worker per actor rank. Each
+  # actor worker exposes one GPU, so each inference instance must use TP1.
+  backend: "sglang:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  # Group concurrency, divided across the four inference DP replicas.
+  # Group concurrency, divided across the eight inference DP replicas.
   max_concurrent_rollouts: 32
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}

@@ -8,12 +8,56 @@ from pathlib import Path
 
 from examples.game_policy_async.tasks import load_rows
 
-from areal import PPOTrainer
-from areal.api.cli_args import PPOConfig, load_expr_config
+
+def validate_colocation(config, actor, rollout) -> None:
+    """Check the example's one-GPU-per-worker fork contract before launch."""
+    strategy = config.rollout.scheduling_strategy
+    if strategy.type != "colocation":
+        return
+    if strategy.target != "actor" or not strategy.fork:
+        raise ValueError("This example requires forked colocation with actor")
+    if actor.world_size != rollout.dp_size:
+        raise ValueError(
+            "Colocation worker count mismatch: actor creates "
+            f"{actor.world_size} workers but rollout creates {rollout.dp_size}; "
+            "use one TP1 rollout replica per actor rank"
+        )
+    if rollout.tp_size * rollout.pp_size != 1:
+        raise ValueError("Forked single-GPU actor workers require TP1/PP1 rollout")
+    if any(
+        spec.gpu != 1 or spec.port_count < 2 for spec in config.actor.scheduling_spec
+    ):
+        raise ValueError("Forked actor workers require gpu=1 and port_count>=2")
+    if config.scheduler.type == "local" and (
+        config.cluster.n_nodes != 1 or actor.world_size > config.cluster.n_gpus_per_node
+    ):
+        raise ValueError("Local colocation must fit on one node without GPU reuse")
+
+
+def proxy_generation_kwargs(gconfig) -> dict:
+    """Parameters for raw HTTP to AReaL, not an OpenAI SDK call."""
+    return {
+        "model": "default",
+        "temperature": gconfig.temperature,
+        "top_p": gconfig.top_p,
+        "max_completion_tokens": gconfig.max_new_tokens,
+        # AReaL filters top-level parameters by its create() signature. The
+        # template options must reach create(extra_body=...) intact.
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+    }
 
 
 def main(args: list[str]) -> None:
+    from areal import PPOTrainer
+    from areal.api.alloc_mode import ModelAllocation
+    from areal.api.cli_args import PPOConfig, load_expr_config
+
     config, _ = load_expr_config(args, PPOConfig)
+    validate_colocation(
+        config,
+        ModelAllocation.from_str(config.actor.backend).parallel,
+        ModelAllocation.from_str(config.rollout.backend).parallel,
+    )
     if (
         config.actor._version != "v1"
         or config.rollout._version != "v1"
@@ -53,11 +97,7 @@ def main(args: list[str]) -> None:
         "evaluation_timeout": float(
             os.environ.get("AGENTICK_EVALUATION_TIMEOUT", "600")
         ),
-        "model": "default",
-        "temperature": config.gconfig.temperature,
-        "top_p": config.gconfig.top_p,
-        "max_completion_tokens": config.gconfig.max_new_tokens,
-        "chat_template_kwargs": {"enable_thinking": True},
+        **proxy_generation_kwargs(config.gconfig),
     }
     if not 1 <= workflow_kwargs["max_rounds"] <= 16:
         raise ValueError("Require 1 <= AGENTICK_MAX_ROUNDS <= 16")
