@@ -81,6 +81,11 @@ Qwen3 reasoning is separated by the proxy (`reasoning_parser: qwen3`,
 leading `<think>...</think>` block from APIs returning raw text. Original tokens remain
 in AReaL's training cache. This example uses text observations, without images.
 
+The training client sends raw HTTP JSON to AReaL with
+`extra_body: {chat_template_kwargs: {enable_thinking: true}}`. Frozen SGLang evaluation
+keeps `chat_template_kwargs` at the JSON top level. These are different server
+contracts; do not globally wrap the shared HTTP client's payload.
+
 ## Start the execution service
 
 Copy `agentick_service/` to the CPU host or sandbox. From its parent directory, using
@@ -139,10 +144,41 @@ python -m examples.game_policy_async.train \
   --config examples/game_policy_async/config.yaml
 ```
 
-Actor and rollout use DP4 × TP2 on the same eight GPUs. Training uses BF16 parameters
-and FP32 optimizer masters, CP1, Megatron Bridge, and disabled MTP. SGLang's memory
-saver is enabled; expandable-segment allocation is disabled for AWEX memory remapping.
-Training and inference alternate on the shared GPUs.
+Actor uses DP4 × TP2 (eight rank workers); rollout uses DP8 × TP1 (eight inference
+workers). Forked colocation requires equal worker counts, not merely equal total GPU
+counts: each actor worker exposes one card, inherited by its inference worker. AWEX
+supports different actor/inference TP layouts. Training uses BF16 parameters and FP32
+optimizer masters, CP1, Megatron Bridge, and disabled MTP. SGLang's memory saver is
+enabled; expandable-segment allocation is disabled for AWEX memory remapping. Training
+and inference alternate on the shared GPUs. Each TP1 inference replica now holds the
+full model; verify per-card memory headroom on the target hardware before a full run.
+The entry point rejects incompatible worker counts or multi-GPU inference instances
+before constructing the trainer.
+
+### Deterministic FlashInfer prefill
+
+The recipe sets `sglang.chunked_prefill_size: 4096` and
+`sglang.max_prefill_tokens: 4096` to bound temporary prefill workspace without reducing
+the 32K context limit. In the tested SGLang **0.5.10.post1** runtime, deterministic
+FlashInfer forces a 2 GiB workspace; simply setting a larger
+`SGLANG_FLASHINFER_WORKSPACE_SIZE` is overwritten by that backend. Unchunked long
+prompts exceeded this workspace during concurrent rollout.
+
+That runtime also aligns intermediate prefill chunks to
+`SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE` (default **4096**). A 2048-token chunk
+budget can leave long requests unschedulable even while the HTTP server is healthy. The
+entry point rejects disabled, undersized or non-aligned chunks for this mode, and a
+prefill token budget smaller than one tile. If overriding the tile environment variable,
+keep it identical on the trainer and inference workers. This check is example-specific,
+not a change to SGLang's scheduler or a universal backend limit. The final tail and full
+prompt/output lengths need not be multiples of 4096.
+
+A single-GPU canary with 16 concurrent requests, each containing 24,576 input tokens and
+up to 64 output tokens, passed with these settings. An eight-GPU colocated run also
+completed its first optimizer update without a prefill workspace overflow. This is
+**not** a guarantee that all training batches fit: that run later encountered an
+actor-side CUDA OOM in `ppo_update`, a separate memory-budget issue. No SIF rebuild or
+FlashInfer package modification is needed for this prefill workaround.
 
 The default batch is **eight groups × four candidates = 32 candidate sessions**, with
 32–128 model calls per update. With 384 rows and one epoch, this is nominally 48 updates
@@ -150,14 +186,14 @@ and 1,536 candidates. Dropped groups, prefetch and early termination can change 
 work. Start with a short cloud run by adding
 `total_train_steps=2 gconfig.max_new_tokens=1024` before the full epoch.
 
-| Control                           | Default | Unit                                          |
-| --------------------------------- | ------: | --------------------------------------------- |
-| `train_dataset.batch_size`        |       8 | Groups per update                             |
-| `rollout.max_concurrent_rollouts` |      32 | Group slots across four inference DP replicas |
-| `gconfig.n_samples`               |       4 | Candidate sessions per group                  |
-| `sglang.max_running_requests`     |      16 | Generation requests per inference replica     |
-| Service `--evaluations`           |      16 | Simultaneously executing games                |
-| Service `--max-pending`           |     256 | Executing plus queued game requests           |
+| Control                           | Default | Unit                                           |
+| --------------------------------- | ------: | ---------------------------------------------- |
+| `train_dataset.batch_size`        |       8 | Groups per update                              |
+| `rollout.max_concurrent_rollouts` |      32 | Group slots across eight inference DP replicas |
+| `gconfig.n_samples`               |       4 | Candidate sessions per group                   |
+| `sglang.max_running_requests`     |      16 | Generation requests per inference replica      |
+| Service `--evaluations`           |      16 | Simultaneously executing games                 |
+| Service `--max-pending`           |     256 | Executing plus queued game requests            |
 
 Batch eight and `max_head_offpolicyness: 3` allow up to `8 × (3 + 1) = 32` outstanding
 groups, matching the group slots. Reducing either value lowers the ceiling even when

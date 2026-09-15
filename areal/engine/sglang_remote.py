@@ -456,19 +456,37 @@ class SGLangBackend:
         self._readiness_endpoint = (
             "/model_info" if awex_colocate or awex_meta_addr else "/health"
         )
-        # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
-        # servers sharing a node never claim the same GPU range. The controller
-        # cannot do this reliably because its global rank -> node-slot mapping is
-        # not guaranteed by SLURM task dispatch (a collision degrades the
-        # TP group into an unsharded single-GPU load -> OOM). SLURM_LOCALID is the
-        # only id guaranteed unique per node-slot, and only the worker sees it at
-        # runtime. `_awex_gpus_per_server` is injected by the controller exclusively
+        # Colocate placement uses process-local CUDA ordinals. A forked worker
+        # may inherit a CVD already restricted to this instance; then its base
+        # is zero, regardless of global rank or inherited SLURM_LOCALID. For
+        # shared-node visibility, keep the Slurm slot offset (or the controller's
+        # explicit base outside Slurm). Do not rewrite CVD: AWEX still needs it
+        # to map logical devices to physical GPU metadata keys.
+        # `_awex_gpus_per_server` is injected by the controller exclusively
         # for real colocation, so its presence doubles as the colocate gate; it is
         # absent for separated mode (where CVD isolation keeps base_gpu_id at 0).
         awex_gpus_per_server = server_args.pop("_awex_gpus_per_server", None)
         if awex_gpus_per_server is not None:
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            devices = (
+                None if visible is None else [d.strip() for d in visible.split(",")]
+            )
+            if devices is not None:
+                if any(not d or d == "-1" for d in devices) or len(set(devices)) != len(
+                    devices
+                ):
+                    raise ValueError(
+                        "Invalid CUDA_VISIBLE_DEVICES for colocated SGLang"
+                    )
+                if len(devices) < int(awex_gpus_per_server):
+                    raise ValueError(
+                        "Colocated SGLang has fewer visible GPUs than required: "
+                        f"{len(devices)} < {awex_gpus_per_server}"
+                    )
             slurm_localid = os.environ.get("SLURM_LOCALID")
-            if slurm_localid is not None:
+            if devices is not None and len(devices) == int(awex_gpus_per_server):
+                server_args["base_gpu_id"] = 0
+            elif slurm_localid is not None:
                 base_gpu_id = int(slurm_localid) * int(awex_gpus_per_server)
                 server_args["base_gpu_id"] = base_gpu_id
                 logger.info(

@@ -20,11 +20,11 @@ def config(monkeypatch, tmp_path):
 
 
 def test_colocation_and_awex_environment(config):
-    """Both DP4 x TP2 roles fit the same eight cards and allow memory remapping."""
+    """Eight actor ranks fork eight TP1 inference workers on the same cards."""
     cfg = OmegaConf.to_container(config, resolve=True)
     assert cfg["cluster"]["n_nodes"] == 1 and cfg["cluster"]["n_gpus_per_node"] == 8
     assert cfg["actor"]["backend"] == "megatron:d4p1t2c1e1"
-    assert cfg["rollout"]["backend"] == "sglang:d4p1t2"
+    assert cfg["rollout"]["backend"] == "sglang:d8p1t1"
     assert cfg["rollout"]["scheduling_strategy"] == {
         "type": "colocation",
         "target": "actor",
